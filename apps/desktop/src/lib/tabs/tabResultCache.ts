@@ -12,7 +12,7 @@ const DEFAULT_PERSISTENT_CACHE_BYTES = 512 * 1024 * 1024;
 const DEFAULT_ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const PAYLOAD_MAGIC = "DBX_TAB_RESULT_CACHE";
-const PAYLOAD_VERSION = 1;
+const PAYLOAD_VERSION = 2;
 const PAYLOAD_CODEC = "msgpack-columnar";
 type CellValue = QueryResult["rows"][number][number];
 
@@ -90,6 +90,18 @@ interface TabResultSnapshotPayload extends Omit<TabResultSnapshot, "result" | "r
   resultRuns?: ColumnarQueryResultRun[];
 }
 
+interface PooledResultRun extends Omit<QueryResultRunSnapshot, "result" | "results"> {
+  result?: number;
+  results?: number[];
+}
+
+interface PooledSnapshotPayload extends Omit<TabResultSnapshot, "result" | "results" | "resultRuns"> {
+  resultPool: ColumnarQueryResult[];
+  result?: number;
+  results?: number[];
+  resultRuns?: PooledResultRun[];
+}
+
 interface TabResultCacheEnvelope {
   magic: typeof PAYLOAD_MAGIC;
   version: typeof PAYLOAD_VERSION;
@@ -97,7 +109,7 @@ interface TabResultCacheEnvelope {
   cachedAt: number;
   rowCount: number;
   columnCount: number;
-  payload: TabResultSnapshotPayload;
+  payload: PooledSnapshotPayload;
 }
 
 export type ResultCacheBackendName = "indexed-db" | "runtime";
@@ -339,9 +351,12 @@ function cloneLocalColumnFilters(filters: QueryResult["local_column_filters"]): 
   return filters ? Object.fromEntries(Object.entries(filters).map(([columnIndex, values]) => [columnIndex, [...values]])) : undefined;
 }
 
-function stripSessionIds(result: QueryResult | undefined): QueryResult | undefined {
+function stripSessionIds(result: QueryResult | undefined, clones: WeakMap<QueryResult, QueryResult>): QueryResult | undefined {
   if (!result) return undefined;
-  return {
+  result = toRaw(result);
+  const existing = clones.get(result);
+  if (existing) return existing;
+  const cloned: QueryResult = {
     columns: [...result.columns],
     execution_error: result.execution_error,
     statement_index: result.statement_index,
@@ -363,17 +378,19 @@ function stripSessionIds(result: QueryResult | undefined): QueryResult | undefin
     sourceFrom: result.sourceFrom,
     sourceTo: result.sourceTo,
   };
+  clones.set(result, cloned);
+  return cloned;
 }
 
-function stripResultSessionIds(results: QueryResult[] | undefined): QueryResult[] | undefined {
-  return results?.map((result) => stripSessionIds(result)!);
+function stripResultSessionIds(results: QueryResult[] | undefined, clones: WeakMap<QueryResult, QueryResult>): QueryResult[] | undefined {
+  return results?.map((result) => stripSessionIds(result, clones)!);
 }
 
-function stripResultRunSessionIds(resultRuns: QueryTab["resultRuns"]): QueryTab["resultRuns"] {
+function stripResultRunSessionIds(resultRuns: QueryTab["resultRuns"], clones: WeakMap<QueryResult, QueryResult>): QueryTab["resultRuns"] {
   return resultRuns?.map((run) => ({
     ...run,
-    result: stripSessionIds(run.result),
-    results: stripResultSessionIds(run.results),
+    result: stripSessionIds(run.result, clones),
+    results: stripResultSessionIds(run.results, clones),
     resultLocalSortOriginalRows: run.resultLocalSortOriginalRows?.map((row) => [...row]),
     resultLocalSortOriginalLargeValueCells: run.resultLocalSortOriginalLargeValueCells?.map((cell) => ({ ...cell })),
     resultLocalSortOriginalMongoDocuments: run.resultLocalSortOriginalMongoDocuments ? clonePlain(run.resultLocalSortOriginalMongoDocuments) : undefined,
@@ -385,7 +402,7 @@ function stripResultRunSessionIds(resultRuns: QueryTab["resultRuns"]): QueryTab[
 function toColumnarResult(result: QueryResult | undefined): ColumnarQueryResult | undefined {
   if (!result) return undefined;
   const columnValues = result.columns.map((_, colIndex) => result.rows.map((row) => row[colIndex] ?? null));
-  return removeUndefinedFields({
+  return {
     columns: [...result.columns],
     execution_error: result.execution_error,
     statement_index: result.statement_index,
@@ -396,8 +413,8 @@ function toColumnarResult(result: QueryResult | undefined): ColumnarQueryResult 
     large_value_cells: result.large_value_cells?.map((cell) => ({ ...cell })),
     columnValues,
     rowCount: result.rows.length,
-    mongo_documents: result.mongo_documents ? clonePlain(result.mongo_documents) : undefined,
-    mongo_copy_documents: result.mongo_copy_documents ? clonePlain(result.mongo_copy_documents) : undefined,
+    mongo_documents: result.mongo_documents,
+    mongo_copy_documents: result.mongo_copy_documents,
     affected_rows: result.affected_rows,
     execution_time_ms: result.execution_time_ms,
     truncated: result.truncated,
@@ -406,11 +423,22 @@ function toColumnarResult(result: QueryResult | undefined): ColumnarQueryResult 
     sourceStatement: result.sourceStatement,
     sourceFrom: result.sourceFrom,
     sourceTo: result.sourceTo,
-  });
+  };
 }
 
 function fromColumnarResult(result: ColumnarQueryResult | undefined): QueryResult | undefined {
-  if (!result) return undefined;
+  if (result === undefined) return undefined;
+  if (
+    !isRecord(result) ||
+    !Number.isSafeInteger(result.rowCount) ||
+    result.rowCount < 0 ||
+    !Array.isArray(result.columns) ||
+    !Array.isArray(result.columnValues) ||
+    result.columns.length !== result.columnValues.length ||
+    !result.columnValues.every((values) => Array.isArray(values) && values.length === result.rowCount)
+  ) {
+    throw new Error("Invalid columnar result dimensions");
+  }
   const rows = Array.from({ length: result.rowCount }, (_, rowIndex) => result.columnValues.map((values) => values[rowIndex] ?? null));
   return {
     columns: [...result.columns],
@@ -436,19 +464,57 @@ function fromColumnarResult(result: ColumnarQueryResult | undefined): QueryResul
   };
 }
 
-function snapshotToPayload(snapshot: TabResultSnapshot): TabResultSnapshotPayload {
-  return removeUndefinedFields({
+function snapshotToPayload(snapshot: TabResultSnapshot): PooledSnapshotPayload {
+  const resultPool: ColumnarQueryResult[] = [];
+  const references = new WeakMap<QueryResult, number>();
+  const reference = (result: QueryResult | undefined): number | undefined => {
+    if (!result) return undefined;
+    const raw = toRaw(result);
+    let index = references.get(raw);
+    if (index === undefined) {
+      index = resultPool.length;
+      references.set(raw, index);
+      resultPool.push(toColumnarResult(raw)!);
+    }
+    return index;
+  };
+  return {
     ...snapshot,
-    result: toColumnarResult(snapshot.result),
-    results: snapshot.results?.map((result) => toColumnarResult(result)!),
-    resultRuns: snapshot.resultRuns?.map((run) =>
-      removeUndefinedFields({
-        ...run,
-        result: toColumnarResult(run.result),
-        results: run.results?.map((result) => toColumnarResult(result)!),
-      }),
-    ),
+    resultPool,
+    result: reference(snapshot.result),
+    results: snapshot.results?.map((result) => reference(result)!),
+    resultRuns: snapshot.resultRuns?.map((run) => ({
+      ...run,
+      result: reference(run.result),
+      results: run.results?.map((result) => reference(result)!),
+      resultSessionId: undefined,
+    })),
+  };
+}
+
+function pooledPayloadToSnapshot(payload: PooledSnapshotPayload): TabResultSnapshot {
+  const { resultPool, ...snapshot } = payload;
+  if (!Array.isArray(resultPool)) throw new Error("Invalid result pool");
+  const results = resultPool.map((result) => {
+    if (!isRecord(result)) throw new Error("Invalid pooled result");
+    return fromColumnarResult(result)!;
   });
+  const resolve = (index: number | undefined): QueryResult | undefined => {
+    if (index === undefined) return undefined;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= results.length) throw new Error("Invalid result reference");
+    return results[index]!;
+  };
+  return {
+    ...snapshot,
+    result: resolve(snapshot.result),
+    results: snapshot.results?.map((index) => resolve(index)!),
+    resultRuns: snapshot.resultRuns?.map((run) => ({
+      ...run,
+      result: resolve(run.result),
+      results: run.results?.map((index) => resolve(index)!),
+      resultSessionId: undefined,
+    })),
+  };
 }
 
 function payloadToSnapshot(payload: TabResultSnapshotPayload): TabResultSnapshot {
@@ -692,16 +758,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function removeUndefinedFields<T>(value: T): T {
-  if (Array.isArray(value)) return value.map((item) => removeUndefinedFields(item)) as T;
-  if (!isRecord(value)) return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entryValue]) => entryValue !== undefined)
-      .map(([key, entryValue]) => [key, removeUndefinedFields(entryValue)]),
-  ) as T;
-}
-
 function isBinaryPayload(value: unknown): value is Uint8Array {
   return value instanceof Uint8Array || value instanceof ArrayBuffer;
 }
@@ -717,24 +773,20 @@ export function encodeTabResultSnapshot(snapshot: TabResultSnapshot): Uint8Array
     columnCount: stats.columnCount,
     payload: snapshotToPayload(snapshot),
   };
-  return encode(removeUndefinedFields(envelope));
+  return encode(envelope, { ignoreUndefined: true });
 }
 
 export function decodeTabResultSnapshot(bytes: Uint8Array | ArrayBuffer): TabResultSnapshot | undefined {
-  let decoded: unknown;
   try {
-    decoded = decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+    const decoded: unknown = decode(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+    if (!isRecord(decoded)) return undefined;
+    if (decoded.magic !== PAYLOAD_MAGIC || (decoded.version !== 1 && decoded.version !== PAYLOAD_VERSION) || decoded.codec !== PAYLOAD_CODEC) return undefined;
+    if (!isRecord(decoded.payload)) return undefined;
+    return decoded.version === 1 ? payloadToSnapshot(decoded.payload as unknown as TabResultSnapshotPayload) : pooledPayloadToSnapshot(decoded.payload as unknown as PooledSnapshotPayload);
   } catch {
     resultCacheDiagnostics.corruptSnapshots += 1;
     return undefined;
   }
-  if (!isRecord(decoded)) return undefined;
-  if (decoded.magic !== PAYLOAD_MAGIC || decoded.version !== PAYLOAD_VERSION || decoded.codec !== PAYLOAD_CODEC) {
-    return undefined;
-  }
-  if (!isRecord(decoded.payload)) return undefined;
-  // SAFETY: The validated envelope is produced by encodeTabResultSnapshot, so its record payload has the snapshot shape expected here.
-  return payloadToSnapshot(decoded.payload as unknown as TabResultSnapshotPayload);
 }
 
 export function tabResultCacheKey(tabId: string): string {
@@ -743,15 +795,19 @@ export function tabResultCacheKey(tabId: string): string {
 
 export function buildTabResultSnapshot(tab: QueryTab): TabResultSnapshot | undefined {
   if (!tab.result && !tab.results && !tab.resultRuns?.length) return undefined;
+  // A query tab and its active run often point to the same result. Detach it
+  // once per snapshot; a fresh map ensures later captures see current edits.
+  const clones = new WeakMap<QueryResult, QueryResult>();
   return {
-    result: stripSessionIds(tab.result),
-    results: stripResultSessionIds(tab.results),
+    result: stripSessionIds(tab.result, clones),
+    results: stripResultSessionIds(tab.results, clones),
     activeResultIndex: tab.activeResultIndex,
     resultEditorFingerprint: tab.resultEditorFingerprint,
     resultLocalSortOriginalRows: tab.resultLocalSortOriginalRows?.map((row) => [...row]),
+    resultLocalSortOriginalLargeValueCells: tab.resultLocalSortOriginalLargeValueCells?.map((cell) => ({ ...cell })),
     resultLocalSortOriginalMongoDocuments: tab.resultLocalSortOriginalMongoDocuments ? clonePlain(tab.resultLocalSortOriginalMongoDocuments) : undefined,
     resultLocalSortOriginalMongoCopyDocuments: tab.resultLocalSortOriginalMongoCopyDocuments ? clonePlain(tab.resultLocalSortOriginalMongoCopyDocuments) : undefined,
-    resultRuns: stripResultRunSessionIds(tab.resultRuns),
+    resultRuns: stripResultRunSessionIds(tab.resultRuns, clones),
     activeResultRunId: tab.activeResultRunId,
     resultViewGeneration: tab.resultViewGeneration,
     queryAnalysis: tab.queryAnalysis ? clonePlain(tab.queryAnalysis) : undefined,

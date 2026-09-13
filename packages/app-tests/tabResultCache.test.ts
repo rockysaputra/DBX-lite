@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
+import { decode, encode } from "@msgpack/msgpack";
+import { reactive } from "vue";
 import { buildTabResultSnapshot, decodeTabResultSnapshot, encodeTabResultSnapshot } from "../../apps/desktop/src/lib/tabs/tabResultCache.ts";
 import type { QueryResult, QueryTab } from "../../apps/desktop/src/types/database.ts";
 
@@ -15,6 +17,117 @@ function queryTab(overrides: Partial<QueryTab> = {}): QueryTab {
     ...overrides,
   };
 }
+
+function sharedResultTab(): QueryTab {
+  const result: QueryResult = {
+    columns: ["id", "body"],
+    rows: Array.from({ length: 100 }, (_, index) => [index, "payload".repeat(100)]),
+    affected_rows: 0,
+    execution_time_ms: 1,
+    session_id: "live-session",
+  };
+  return queryTab({
+    result,
+    results: [reactive(result)],
+    resultRuns: [{ id: "run-1", title: "Run 1", sequence: 1, sql: "select 1", createdAt: 1, result, results: [result], resultSessionId: "live-session" }],
+  });
+}
+
+test("snapshot detaches each raw result once across tab and run aliases", () => {
+  const tab = sharedResultTab();
+  const snapshot = buildTabResultSnapshot(tab)!;
+  assert.notEqual(snapshot.result, tab.result);
+  assert.equal(snapshot.result, snapshot.results![0]);
+  assert.equal(snapshot.result, snapshot.resultRuns![0]!.result);
+  assert.equal(snapshot.result, snapshot.resultRuns![0]!.results![0]);
+  assert.equal(snapshot.result!.session_id, undefined);
+  assert.equal(snapshot.resultRuns![0]!.resultSessionId, undefined);
+  tab.result!.rows[0]![1] = "edited";
+  assert.equal(snapshot.result!.rows[0]![1], "payload".repeat(100));
+  const later = buildTabResultSnapshot(tab)!;
+  assert.notEqual(later.result, snapshot.result);
+  assert.equal(later.result!.rows[0]![1], "edited");
+});
+
+test("wire format stores shared results once and restores their identity", () => {
+  const snapshot = buildTabResultSnapshot(sharedResultTab())!;
+  const bytes = encodeTabResultSnapshot(snapshot);
+  const singleBytes = encodeTabResultSnapshot({ result: snapshot.result, cachedAt: snapshot.cachedAt });
+  assert.ok(bytes.byteLength < singleBytes.byteLength * 1.05, `${bytes.byteLength} vs ${singleBytes.byteLength}`);
+  const restored = decodeTabResultSnapshot(bytes)!;
+  assert.equal(restored.result, restored.results![0]);
+  assert.equal(restored.result, restored.resultRuns![0]!.result);
+  assert.equal(restored.result, restored.resultRuns![0]!.results![0]);
+  assert.deepEqual(restored.result!.rows, snapshot.result!.rows);
+});
+
+test("equal but independent results remain independent after snapshot round trip", () => {
+  const tab = sharedResultTab();
+  tab.results = [structuredClone(tab.result!)];
+  const snapshot = buildTabResultSnapshot(tab)!;
+  assert.notEqual(snapshot.result, snapshot.results![0]);
+  const restored = decodeTabResultSnapshot(encodeTabResultSnapshot(snapshot))!;
+  assert.notEqual(restored.result, restored.results![0]);
+  restored.results![0]!.rows[0]![1] = "edited";
+  assert.equal(restored.result!.rows[0]![1], "payload".repeat(100));
+});
+
+test("version 1 columnar snapshots remain readable", () => {
+  const result = { columns: ["id"], columnValues: [[7]], rowCount: 1, affected_rows: 0, execution_time_ms: 2, sourceLabel: "legacy" };
+  const bytes = encode({ magic: "DBX_TAB_RESULT_CACHE", version: 1, codec: "msgpack-columnar", payload: { result, results: [result], cachedAt: 123 } });
+  const restored = decodeTabResultSnapshot(bytes)!;
+  assert.deepEqual(restored.result!.rows, [[7]]);
+  assert.deepEqual(restored.results![0]!.rows, [[7]]);
+  assert.equal(restored.result!.sourceLabel, "legacy");
+  assert.equal(restored.cachedAt, 123);
+});
+
+test("malformed columnar snapshots are rejected without throwing", () => {
+  const bytes = encode({ magic: "DBX_TAB_RESULT_CACHE", version: 1, codec: "msgpack-columnar", payload: { result: { rowCount: 1 }, cachedAt: 123 } });
+  assert.equal(decodeTabResultSnapshot(bytes), undefined);
+});
+
+test("invalid result pool references reject the whole snapshot without throwing", () => {
+  const bytes = encodeTabResultSnapshot(buildTabResultSnapshot(sharedResultTab())!);
+  for (const reference of [-1, 100, 0.5, "0", null]) {
+    for (const location of ["tab", "results", "run", "runResults"]) {
+      const envelope = decode(bytes) as { payload: { result: unknown; results: unknown[]; resultRuns: { result: unknown; results: unknown[] }[] } };
+      if (location === "tab") envelope.payload.result = reference;
+      if (location === "results") envelope.payload.results[0] = reference;
+      if (location === "run") envelope.payload.resultRuns[0]!.result = reference;
+      if (location === "runResults") envelope.payload.resultRuns[0]!.results[0] = reference;
+      assert.equal(decodeTabResultSnapshot(encode(envelope)), undefined);
+    }
+  }
+});
+
+test("corrupt columnar dimensions reject snapshots before allocating rows", () => {
+  for (const dimensions of [{ rowCount: -1 }, { rowCount: 0.5 }, { rowCount: 2 }, { columns: ["id", "extra"] }]) {
+    const result = { columns: ["id"], columnValues: [[7]], rowCount: 1, affected_rows: 0, execution_time_ms: 1, ...dimensions };
+    for (const version of [1, 2]) {
+      const payload = version === 1 ? { result, cachedAt: 123 } : { result: 0, resultPool: [result], cachedAt: 123 };
+      const bytes = encode({ magic: "DBX_TAB_RESULT_CACHE", version, codec: "msgpack-columnar", payload });
+      assert.equal(decodeTabResultSnapshot(bytes), undefined);
+    }
+  }
+});
+
+test("binary and date Mongo values survive encoding while undefined fields are omitted", () => {
+  const tab = sharedResultTab();
+  tab.result!.mongo_documents = [{ bytes: new Uint8Array([1, 2, 255]), createdAt: new Date("2026-07-24T00:00:00Z"), omitted: undefined, values: [undefined, null] }];
+  const restored = decodeTabResultSnapshot(encodeTabResultSnapshot(buildTabResultSnapshot(tab)!))!;
+  assert.deepEqual(restored.result!.mongo_documents, [{ bytes: new Uint8Array([1, 2, 255]), createdAt: new Date("2026-07-24T00:00:00Z"), values: [null, null] }]);
+});
+
+test("tab original large-value cells survive snapshot creation and round trip", () => {
+  const tab = sharedResultTab();
+  tab.resultLocalSortOriginalLargeValueCells = [{ row_index: 0, column_index: 1, original_bytes: 4096 }];
+  const snapshot = buildTabResultSnapshot(tab)!;
+  assert.deepEqual(snapshot.resultLocalSortOriginalLargeValueCells, tab.resultLocalSortOriginalLargeValueCells);
+  assert.notEqual(snapshot.resultLocalSortOriginalLargeValueCells, tab.resultLocalSortOriginalLargeValueCells);
+  const restored = decodeTabResultSnapshot(encodeTabResultSnapshot(snapshot))!;
+  assert.deepEqual(restored.resultLocalSortOriginalLargeValueCells, tab.resultLocalSortOriginalLargeValueCells);
+});
 
 test("result snapshots strip live session handles and clone result rows", () => {
   const tab = queryTab({
