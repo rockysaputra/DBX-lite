@@ -62,7 +62,8 @@ const publicBasePath = viteBase.startsWith("/") ? viteBase.replace(/\/+$/, "") :
 const apiProxyPath = publicBasePath ? `${publicBasePath}/api` : "/api";
 const backendUrl = process.env.DBX_BACKEND_URL || "http://localhost:4224";
 
-export default defineConfig(async () => ({
+export default defineConfig(async ({ mode }) => ({
+  define: { "import.meta.env.VITE_DBX_LITE": JSON.stringify(mode === "lite" ? "true" : "false") },
   root: import.meta.dirname,
   base: viteBase,
   plugins: [connectionTypesPlugin(), publicBasePathRedirectPlugin(publicBasePath), vue(), tailwindcss()],

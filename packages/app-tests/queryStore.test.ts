@@ -3,6 +3,7 @@ import { afterEach, test, vi } from "vitest";
 import { createPinia, disposePinia, getActivePinia, setActivePinia } from "pinia";
 import { isReactive, nextTick, toRaw } from "vue";
 import { decodeQueryResultArchive } from "../../apps/desktop/src/lib/query/queryResultArchive.ts";
+import { decodeTabResultSnapshot } from "../../apps/desktop/src/lib/tabs/tabResultCache.ts";
 import { analyzeEditableQueryEditability } from "../../apps/desktop/src/lib/sql/sqlAnalysis.ts";
 import { resultSqlForGrid } from "../../apps/desktop/src/lib/tabs/tabPresentation.ts";
 import { dataGridColumnCommentFor } from "../../apps/desktop/src/lib/dataGrid/dataGridColumnLookup.ts";
@@ -1686,7 +1687,10 @@ test("result run pin and close state persist across a restart", async () => {
     store = useQueryStore();
     await store.initOpenTabs();
     const restored = store.tabs.find((item) => item.id === tabId);
-    assert.deepEqual(restored?.resultRuns?.map((run) => run.id), ["run-1"]);
+    assert.deepEqual(
+      restored?.resultRuns?.map((run) => run.id),
+      ["run-1"],
+    );
     assert.equal(restored?.resultRuns?.[0]?.pinned, true);
   } finally {
     restoreStorage();
@@ -1732,7 +1736,10 @@ test("bulk result-run close leaves all runs untouched when the selected run is u
   assert.equal(await store.closeOtherResultRuns(tabId, "run-2"), false);
   assert.equal(await store.closeResultRunsToLeft(tabId, "run-2"), false);
   assert.equal(await store.closeResultRunsToRight(tabId, "run-2"), false);
-  assert.deepEqual(tab.resultRuns?.map((run) => run.id), ["run-1", "run-2", "run-3"]);
+  assert.deepEqual(
+    tab.resultRuns?.map((run) => run.id),
+    ["run-1", "run-2", "run-3"],
+  );
   assert.equal(tab.activeResultRunId, "run-1");
   assert.deepEqual(tab.result?.rows, [[1]]);
 });
@@ -1787,10 +1794,7 @@ test("bulk result-run close does not rewrite a deleted session-backed snapshot",
       resultSessionId: "session-1",
       resultCacheKey: "tab:tab-1:run:run-1",
     };
-    tab.resultRuns = [
-      removedRun,
-      { id: "run-2", title: "Run 2", sequence: 2, sql: "select 2", createdAt: 2, result: { columns: ["two"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 } },
-    ];
+    tab.resultRuns = [removedRun, { id: "run-2", title: "Run 2", sequence: 2, sql: "select 2", createdAt: 2, result: { columns: ["two"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 } }];
     tab.activeResultRunId = removedRun.id;
     tab.result = removedRun.result;
     tab.resultSessionId = removedRun.resultSessionId;
@@ -1889,7 +1893,10 @@ test("closing a tab releases result payloads retained by deactivated grids", () 
 
   store.closeTab(tabId, { force: true });
 
-  assert.equal(store.tabs.some((item) => item.id === tabId), false);
+  assert.equal(
+    store.tabs.some((item) => item.id === tabId),
+    false,
+  );
   assert.deepEqual(retainedResult.columns, []);
   assert.deepEqual(retainedResult.rows, []);
   assert.equal(retainedResult.mongo_documents, undefined);
@@ -2181,10 +2188,12 @@ test("auto-saved result stays visible until the next run is ready", async () => 
     assert.deepEqual(tab.result?.columns, ["run_1"]);
     assert.deepEqual(tab.resultRuns?.[0]?.result?.rows, [[1]]);
 
-    resolveSecondExecution?.(new Response(JSON.stringify([{ columns: ["run_2"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    resolveSecondExecution?.(
+      new Response(JSON.stringify([{ columns: ["run_2"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
     await execution;
 
     assert.equal(tab.resultRuns?.length, 2);
@@ -4042,6 +4051,7 @@ test("evicting cached tab results releases multi-result payloads and sessions", 
 
   globalThis.fetch = withConnectionHealthMock(async (input, init) => {
     const url = String(input);
+    if (url === "/api/tab-runtime-cache") return new Response("true", { status: 200 });
     if (url === "/api/query/execute-multi") {
       executeCount++;
       const results: QueryResult[] = [
@@ -4126,6 +4136,7 @@ test("result cache eviction keeps recently accessed inactive tabs", async () => 
 
   globalThis.fetch = withConnectionHealthMock(async (input) => {
     const url = String(input);
+    if (url === "/api/tab-runtime-cache") return new Response("true", { status: 200 });
     if (url === "/api/query/execute-multi") {
       executeCount++;
       const results: QueryResult[] = [
@@ -9561,4 +9572,150 @@ test("reorderTab reports adjacent no-op drops without replacing tab order", () =
   assert.deepEqual(store.tabs, originalTabs);
   assert.equal(store.reorderTab(tabC, "missing", "before"), false);
   assert.deepEqual(store.tabs, originalTabs);
+});
+
+test("pinning a result captures rows before deferred cache serialization", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let encoded: string | undefined;
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    if (String(input) === "/api/tab-runtime-cache" && init?.method === "POST") {
+      encoded = JSON.parse(String(init.body)).payloadBase64;
+    }
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+  try {
+    const id = store.createTab("conn-1", "db");
+    const tab = store.tabs.find((item) => item.id === id)!;
+    const result: QueryResult = { columns: ["id"], rows: [[7]], affected_rows: 0, execution_time_ms: 1 };
+    tab.result = result;
+    tab.resultRuns = [{ id: "run-1", title: "Result 1", sequence: 1, sql: "select 7", createdAt: 1, result }];
+    assert.equal(store.toggleResultRunPinned(id, "run-1"), true);
+    // Eviction releases live payloads in place while the cache write is awaiting paint.
+    result.rows = [];
+    result.columns = [];
+    await waitFor(() => encoded !== undefined);
+    const restored = decodeTabResultSnapshot(Uint8Array.from(atob(encoded!), (value) => value.charCodeAt(0)))!;
+    assert.deepEqual(restored.result?.rows, [[7]]);
+    assert.equal(restored.result, restored.resultRuns?.[0]?.result);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("MCP execute-and-show obeys inactive residency and restores evicted data", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const cache = new Map<string, string>();
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/tab-runtime-cache" && init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      cache.set(body.key, body.payloadBase64);
+    }
+    if (url.startsWith("/api/tab-runtime-cache?key=") && !init?.method) {
+      const key = new URL(url, "http://127.0.0.1").searchParams.get("key")!;
+      return new Response(JSON.stringify({ payloadBase64: cache.get(key) }), { status: 200 });
+    }
+    return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+  try {
+    const ids = Array.from({ length: 7 }, (_, index) => store.showExecutedQueryResults("conn-1", "db", `select ${index}`, [{ columns: ["id"], rows: [[index]], affected_rows: 0, execution_time_ms: 1 }]));
+    await waitFor(() => store.tabs.find((tab) => tab.id === ids[0])?.resultEvicted === true);
+    assert.ok(store.tabs.find((tab) => tab.id === ids[6])?.result);
+    assert.equal(store.tabs.filter((tab) => tab.id !== ids[6] && tab.result).length, 5);
+    store.switchTab(ids[0]!);
+    await store.reloadEvictedTab(ids[0]!);
+    await waitFor(() => store.tabs.find((tab) => tab.id === ids[0])?.result?.rows[0]?.[0] === 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("Lite evicts inactive MCP results earlier and keeps them restorable", async () => {
+  vi.stubEnv("VITE_DBX_LITE", "true");
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const cache = new Map<string, string>();
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/tab-runtime-cache" && init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      cache.set(body.key, body.payloadBase64);
+    }
+    if (url.startsWith("/api/tab-runtime-cache?key=")) {
+      const key = new URL(url, "http://127.0.0.1").searchParams.get("key")!;
+      return new Response(JSON.stringify({ payloadBase64: cache.get(key) }), { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  });
+  try {
+    const ids = Array.from({ length: 4 }, (_, index) => store.showExecutedQueryResults("conn-1", "db", `select ${index}`, [{ columns: ["id"], rows: [[index]], affected_rows: 0, execution_time_ms: 1 }]));
+    await waitFor(() => store.tabs.find((tab) => tab.id === ids[0])?.resultEvicted === true);
+    assert.equal(store.tabs.filter((tab) => tab.id !== ids[3] && tab.result).length, 2);
+    store.switchTab(ids[0]!);
+    await store.reloadEvictedTab(ids[0]!);
+    assert.deepEqual(store.tabs.find((tab) => tab.id === ids[0])?.result?.rows, [[0]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+    vi.unstubAllEnvs();
+  }
+});
+
+test("failed cache persistence cannot discard an inactive result", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let attemptedWrites = 0;
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    if (String(input) === "/api/tab-runtime-cache" && init?.method === "POST") attemptedWrites++;
+    return new Response("fixture disk full", { status: 503 });
+  });
+  try {
+    const ids = Array.from({ length: 7 }, (_, index) => store.showExecutedQueryResults("conn-1", "db", `select ${index}`, [{ columns: ["id"], rows: [[index]], affected_rows: 0, execution_time_ms: 1 }]));
+    await waitFor(() => attemptedWrites > 0);
+    assert.deepEqual(store.tabs.find((tab) => tab.id === ids[0])?.result?.rows, [[0]]);
+    assert.equal(store.tabs.find((tab) => tab.id === ids[0])?.resultEvicted, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("returning to a tab during cache persistence keeps its displayed result", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let finishWrite: (() => void) | undefined;
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    if (String(input) === "/api/tab-runtime-cache" && init?.method === "POST") {
+      await new Promise<void>((resolve) => {
+        finishWrite = resolve;
+      });
+    }
+    return new Response("{}", { status: 200 });
+  });
+  try {
+    const ids = Array.from({ length: 7 }, (_, index) => store.showExecutedQueryResults("conn-1", "db", `select ${index}`, [{ columns: ["id"], rows: [[index]], affected_rows: 0, execution_time_ms: 1 }]));
+    await waitFor(() => finishWrite !== undefined);
+    store.switchTab(ids[0]!);
+    finishWrite!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(store.tabs.find((tab) => tab.id === ids[0])?.result?.rows, [[0]]);
+  } finally {
+    finishWrite?.();
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
 });

@@ -93,6 +93,7 @@ DBX_*_x64-portable.zip
 .agents/skills
 .pnpm-store/*
 .dbx-web
+.dbx-lite-data/
 # Local devtest connections (contains credentials; do not commit)
 dbx-devtest-connections.json
 .npmrc

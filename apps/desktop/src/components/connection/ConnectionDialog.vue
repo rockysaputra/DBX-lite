@@ -16,6 +16,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Switch } from "@/components/ui/switch";
 import type { ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, HttpTunnelConfig, IdentifierCase, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
 import { CONNECTION_PICKER_OPTIONS, CONNECTION_PROFILES, CONNECTION_PROFILE_ICONS, type ConnectionPickerOption, type ConnectionProfileCategory, type ConnectionProfileDefinition } from "@/types/generated/connectionProfiles";
+import { filterLiteConnectionOptions } from "@/lib/connection/liteConnectionOptions";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { VictoriaMetricsExternalConfig } from "@/types/victoriametrics";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
@@ -2888,12 +2889,15 @@ function jdbcProductCategory(profileId: string): DbCategoryKey {
 
 // `influxdb3` is presented as a version option inside the InfluxDB card
 // (see the version <Select> below), not as a standalone picker entry.
-const dbOptions: DbOption[] = [...CONNECTION_PICKER_OPTIONS.filter((option) => option.value !== "influxdb3"), ...jdbcProductPickerOptions().map((option) => ({ ...option, category: jdbcProductCategory(option.value) }))];
+const allDbOptions: DbOption[] = [...CONNECTION_PICKER_OPTIONS.filter((option) => option.value !== "influxdb3"), ...jdbcProductPickerOptions().map((option) => ({ ...option, category: jdbcProductCategory(option.value) }))];
+const dbOptions = import.meta.env.VITE_DBX_LITE === "true" ? filterLiteConnectionOptions(allDbOptions) : allDbOptions;
 
-const dbCategoryDefinitions = dbCategoryMetadata.map((category) => ({
-  ...category,
-  optionValues: dbOptions.filter((option) => option.category === category.key).map((option) => option.value),
-}));
+const dbCategoryDefinitions = dbCategoryMetadata
+  .map((category) => ({
+    ...category,
+    optionValues: dbOptions.filter((option) => option.category === category.key).map((option) => option.value),
+  }))
+  .filter((category) => category.optionValues.length > 0);
 
 // Keep the picker exhaustive as database drivers are added or reorganized.
 assertCompleteDatabaseCategories(

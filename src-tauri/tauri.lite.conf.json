@@ -1,0 +1,21 @@
+{
+  "productName": "DBX Lite",
+  "identifier": "com.dbx.lite",
+  "build": {
+    "beforeDevCommand": "node node_modules/vite/bin/vite.js --config apps/desktop/vite.config.ts --mode lite",
+    "beforeBuildCommand": "node node_modules/vite/bin/vite.js build --config apps/desktop/vite.config.ts --mode lite"
+  },
+  "app": {
+    "windows": [{
+      "title": "DBX Lite", "width": 1280, "height": 800,
+      "minWidth": 900, "minHeight": 600, "visible": false,
+      "titleBarStyle": "Overlay", "trafficLightPosition": { "x": 16, "y": 18 },
+      "hiddenTitle": true, "acceptFirstMouse": true
+    }]
+  },
+  "bundle": { "createUpdaterArtifacts": false, "targets": ["app"] },
+  "plugins": {
+    "deep-link": { "desktop": { "schemes": ["dbx-lite"] } },
+    "updater": { "endpoints": [] }
+  }
+}

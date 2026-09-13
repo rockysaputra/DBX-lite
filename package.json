@@ -5,6 +5,12 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
+    "lite:dev": "node scripts/lite/run.mjs dev",
+    "lite:build": "node scripts/lite/run.mjs build",
+    "lite:build:debug": "node scripts/lite/run.mjs build --debug",
+    "lite:start": "node scripts/lite/run.mjs start",
+    "lite:start:debug": "node scripts/lite/run.mjs start --debug",
+    "lite:benchmark": "TSX_TSCONFIG_PATH=apps/desktop/tsconfig.json node --expose-gc --import tsx scripts/lite/benchmark-result-cache.ts",
     "dev": "vite --config apps/desktop/vite.config.ts",
     "dev:tauri": "tauri dev",
     "dev:web": "vite --config apps/desktop/vite.config.ts --port 5173 --mode web",

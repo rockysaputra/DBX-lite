@@ -14,10 +14,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["duckdb-sidecar", "dynamodb", "mq-admin", "sqlite-multiple-ciphers", "system-fonts"]
+lite = ["dynamodb", "sqlite-multiple-ciphers", "system-fonts"]
 custom-protocol = ["tauri/custom-protocol"]
-duckdb-sidecar = ["dbx-core/duckdb-sidecar"]
+duckdb-sidecar = ["dbx-core/duckdb-sidecar", "dbx-mcp/duckdb-sidecar"]
 dynamodb = ["dbx-core/dynamodb"]
-mq-admin = ["dbx-core/mq-admin"]
+mq-admin = ["dbx-core/mq-admin", "dbx-mcp/mq-admin"]
 sqlite-sqlcipher = ["dbx-core/sqlite-sqlcipher"]
 sqlite-multiple-ciphers = ["dbx-core/sqlite-multiple-ciphers"]
 sqlite-bundled = ["dbx-core/sqlite-bundled"]
@@ -67,7 +68,7 @@ csv = "1.4.0"
 calamine = "0.30.1"
 zip = "4.6.1"
 dbx-core = { path = "../crates/dbx-core", default-features = false }
-dbx-mcp = { path = "../crates/dbx-mcp", default-features = false, features = ["duckdb-sidecar", "mq-admin"] }
+dbx-mcp = { path = "../crates/dbx-mcp", default-features = false }
 wry = { path = "../vendor/wry" }
 axum = { version = "0.8", features = ["ws"] }
 font-kit = "0.14.3"

@@ -1254,8 +1254,9 @@ export const useQueryStore = defineStore("query", () => {
   function tableStructureRefreshVersion(connectionId: string, database: string, schema: string | undefined, tableName: string): number {
     return tableStructureRefreshVersions.value[tableStructureKey(connectionId, database, schema, tableName)] ?? 0;
   }
-  const MAX_CACHED_RESULTS = 5;
-  const MAX_CACHED_RESULT_BYTES = 128 * 1024 * 1024;
+  const isLite = import.meta.env.VITE_DBX_LITE === "true";
+  const MAX_CACHED_RESULTS = isLite ? 2 : 5;
+  const MAX_CACHED_RESULT_BYTES = (isLite ? 32 : 128) * 1024 * 1024;
 
   function queryExecutionLog(level: "debug" | "info" | "warn" | "error", event: string, details: Record<string, unknown>) {
     appendDebugLog(level, `[DBX][executeTabSql:${event}]`, details);
@@ -1851,27 +1852,19 @@ export const useQueryStore = defineStore("query", () => {
     run.resultCacheState = "memory";
     return writeTabResultSnapshot(
       key,
-      {
-        result: run.result,
-        results: run.results,
-        activeResultIndex: run.activeResultIndex,
-        resultEditorFingerprint: run.resultEditorFingerprint,
+      buildTabResultSnapshot({
+        // Capture before writeTabResultSnapshot awaits paint. A concurrent
+        // eviction may clear the live run's result objects in place.
+        ...run,
+        id: tab.id,
+        title: tab.title,
+        connectionId: tab.connectionId,
+        database: tab.database,
+        mode: tab.mode,
+        isExecuting: false,
         resultRuns: [run],
         activeResultRunId: run.id,
-        queryAnalysis: run.queryAnalysis,
-        querySourceColumns: run.querySourceColumns,
-        queryWriteTargets: run.queryWriteTargets,
-        resultColumnComments: run.resultColumnComments,
-        queryDisplaySourceColumns: run.queryDisplaySourceColumns,
-        queryEditabilityReason: run.queryEditabilityReason,
-        tableMeta: run.tableMeta,
-        resultPageSql: run.resultPageSql,
-        resultPageLimit: run.resultPageLimit,
-        resultPageOffset: run.resultPageOffset,
-        resultCountSql: run.resultCountSql,
-        resultTotalRowCount: run.resultTotalRowCount,
-        cachedAt: Date.now(),
-      },
+      }),
       tab.connectionId,
     );
   }
@@ -2152,11 +2145,20 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   async function evictCachedResult(tab: QueryTab) {
+    const result = tab.result;
+    const results = tab.results;
+    const generation = tab.resultViewGeneration;
+    const canEvict = () => tabs.value.includes(tab) && tab.id !== activeTabId.value && !tab.isExecuting && tab.result === result && tab.results === results && tab.resultViewGeneration === generation;
+    if (!canEvict()) return;
     await closeResultSession(tab);
+    if (!canEvict()) return;
     const cacheKey = tabResultCacheKey(tab.id);
     const cached = await writeTabResultSnapshot(cacheKey, buildTabResultSnapshot(tab), tab.connectionId);
-    tab.resultCacheKey = cached ? cacheKey : undefined;
-    tab.resultCacheState = cached ? "disk" : "missing";
+    // Keep the only recoverable copy when disk persistence fails. A tab may
+    // also become active or receive a new result while this write is pending.
+    if (!cached || !canEvict()) return;
+    tab.resultCacheKey = cacheKey;
+    tab.resultCacheState = "disk";
     clearResultPayload(tab, { evicted: true });
   }
 
@@ -2607,6 +2609,7 @@ export const useQueryStore = defineStore("query", () => {
     // one: publish a fresh generation so the tab can capture a view snapshot.
     publishResultGeneration(tab, "execute");
     if (tab.result) touchResult(tab);
+    scheduleResultCacheTrim();
     return id;
   }
 
