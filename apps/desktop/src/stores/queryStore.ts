@@ -1254,9 +1254,10 @@ export const useQueryStore = defineStore("query", () => {
   function tableStructureRefreshVersion(connectionId: string, database: string, schema: string | undefined, tableName: string): number {
     return tableStructureRefreshVersions.value[tableStructureKey(connectionId, database, schema, tableName)] ?? 0;
   }
-  const isLite = import.meta.env.VITE_DBX_LITE === "true";
-  const MAX_CACHED_RESULTS = isLite ? 2 : 5;
-  const MAX_CACHED_RESULT_BYTES = (isLite ? 32 : 128) * 1024 * 1024;
+  // Tighter limits increased native cache-transfer peaks in local profiling.
+  // Keep the upstream budget until serialization/IPC costs are reduced.
+  const MAX_CACHED_RESULTS = 5;
+  const MAX_CACHED_RESULT_BYTES = 128 * 1024 * 1024;
 
   function queryExecutionLog(level: "debug" | "info" | "warn" | "error", event: string, details: Record<string, unknown>) {
     appendDebugLog(level, `[DBX][executeTabSql:${event}]`, details);

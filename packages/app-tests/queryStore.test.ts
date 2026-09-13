@@ -9638,39 +9638,6 @@ test("MCP execute-and-show obeys inactive residency and restores evicted data", 
   }
 });
 
-test("Lite evicts inactive MCP results earlier and keeps them restorable", async () => {
-  vi.stubEnv("VITE_DBX_LITE", "true");
-  const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
-  const store = useQueryStore();
-  const originalFetch = globalThis.fetch;
-  const cache = new Map<string, string>();
-  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
-    const url = String(input);
-    if (url === "/api/tab-runtime-cache" && init?.method === "POST") {
-      const body = JSON.parse(String(init.body));
-      cache.set(body.key, body.payloadBase64);
-    }
-    if (url.startsWith("/api/tab-runtime-cache?key=")) {
-      const key = new URL(url, "http://127.0.0.1").searchParams.get("key")!;
-      return new Response(JSON.stringify({ payloadBase64: cache.get(key) }), { status: 200 });
-    }
-    return new Response("{}", { status: 200 });
-  });
-  try {
-    const ids = Array.from({ length: 4 }, (_, index) => store.showExecutedQueryResults("conn-1", "db", `select ${index}`, [{ columns: ["id"], rows: [[index]], affected_rows: 0, execution_time_ms: 1 }]));
-    await waitFor(() => store.tabs.find((tab) => tab.id === ids[0])?.resultEvicted === true);
-    assert.equal(store.tabs.filter((tab) => tab.id !== ids[3] && tab.result).length, 2);
-    store.switchTab(ids[0]!);
-    await store.reloadEvictedTab(ids[0]!);
-    assert.deepEqual(store.tabs.find((tab) => tab.id === ids[0])?.result?.rows, [[0]]);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreStorage();
-    vi.unstubAllEnvs();
-  }
-});
-
 test("failed cache persistence cannot discard an inactive result", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
