@@ -1114,11 +1114,6 @@ pub fn truncate_result_with_max_rows(mut result: db::QueryResult, max_rows: Opti
     result
 }
 
-fn normalize_query_result_for_js(mut result: db::QueryResult) -> db::QueryResult {
-    result.rows = result.rows.into_iter().map(|row| row.into_iter().map(db::json_value_for_js).collect()).collect();
-    result
-}
-
 pub fn agent_execute_query_params(
     sql: &str,
     database: Option<&str>,
@@ -2258,7 +2253,6 @@ async fn do_execute_typed(
         PoolKind::Consul(_) => Err("SQL execution is not supported for Consul connections".to_string()),
     };
     result
-        .map(normalize_query_result_for_js)
         .map_err(|error| {
             #[cfg(feature = "duckdb-sidecar")]
             if let Some(duckdb_error) = typed_duckdb_error {
@@ -9913,10 +9907,10 @@ for line in sys.stdin:
             messages: Vec::new(),
         };
 
-        let normalized = normalize_query_result_for_js(result);
+        let serialized = serde_json::to_value(result).unwrap();
 
-        assert_eq!(normalized.rows[0][0], serde_json::json!("2041797190226354178"));
-        assert_eq!(normalized.rows[0][1], serde_json::json!([1, "2041797190226354178"]));
+        assert_eq!(serialized["rows"][0][0], serde_json::json!("2041797190226354178"));
+        assert_eq!(serialized["rows"][0][1], serde_json::json!([1, "2041797190226354178"]));
     }
 
     #[test]
