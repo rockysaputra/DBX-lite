@@ -1915,7 +1915,7 @@ struct SqlImportRowStream {
     splitter: Option<StreamingSqlFileSplitter>,
     family: SqlImportDialectFamily,
     target: Option<SqlInsertTarget>,
-    rows: Vec<Vec<serde_json::Value>>,
+    rows: std::collections::VecDeque<Vec<serde_json::Value>>,
     total_rows: usize,
 }
 
@@ -1944,7 +1944,7 @@ impl SqlImportRowStream {
             splitter: Some(StreamingSqlFileSplitter::new(options.sql_dialect, parsing_options)),
             family,
             target: None,
-            rows: Vec::new(),
+            rows: std::collections::VecDeque::new(),
             total_rows: 0,
         })
     }
@@ -1998,15 +1998,18 @@ impl SqlImportRowStream {
 
     fn consume_statements(&mut self, statements: &[crate::sql::SqlStatementWithControl]) -> Result<(), String> {
         let dialect = sql_import_parser_dialect(self.family);
+        let mut rows = Vec::new();
         collect_sql_import_rows(
             statements.iter().map(|statement| statement.sql.as_str()),
             dialect.as_ref(),
             self.family,
             &mut self.target,
-            &mut self.rows,
+            &mut rows,
             usize::MAX,
             &mut self.total_rows,
-        )
+        )?;
+        self.rows.extend(rows);
+        Ok(())
     }
 }
 

@@ -819,14 +819,6 @@ impl SqlFileStreamDecoder {
         Self::open_with_options(file_path, None, normalize_mysql_binary_literals, None).await
     }
 
-    async fn open_for_target_with_progress(
-        file_path: &Path,
-        normalize_mysql_binary_literals: bool,
-        bytes_read: Arc<AtomicU64>,
-    ) -> Result<Self, String> {
-        Self::open_with_options(file_path, None, normalize_mysql_binary_literals, Some(bytes_read)).await
-    }
-
     /// 以调用方已经确定的编码打开解码器。
     ///
     /// 表导入会先解析用户的编码设置：显式选择了编码时不再自动探测，

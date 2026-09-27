@@ -317,8 +317,7 @@ const BRIDGE_HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 /// Reads one HTTP/1.1 request off the bridge connection: the header block
 /// first, then exactly `Content-Length` body bytes. TCP delivers large
 /// bodies across multiple segments, so a single read truncates them; a
-/// closed or short read still returns whatever arrived so routing can
-/// answer with a precise 400 instead of dropping the connection.
+/// incomplete request is dropped instead of executing a valid-looking prefix.
 async fn read_bridge_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 16384];
@@ -328,21 +327,25 @@ async fn read_bridge_request(stream: &mut tokio::net::TcpStream) -> Option<Strin
     loop {
         if let Some(end) = header_end {
             if buf.len() >= end + content_length {
-                return Some(String::from_utf8_lossy(&buf).into_owned());
+                return Some(String::from_utf8_lossy(&buf[..end + content_length]).into_owned());
             }
         } else if let Some(pos) =
             buf[scanned..].windows(BRIDGE_HEADER_TERMINATOR.len()).position(|window| window == BRIDGE_HEADER_TERMINATOR)
         {
             let end = scanned + pos + BRIDGE_HEADER_TERMINATOR.len();
             header_end = Some(end);
-            content_length = parse_content_length(&String::from_utf8_lossy(&buf[..end]));
+            content_length = parse_content_length(&String::from_utf8_lossy(&buf[..end]))?;
+            if content_length > MAX_BRIDGE_REQUEST_BYTES.saturating_sub(end) {
+                return None;
+            }
+            continue;
         } else {
             scanned = buf.len().saturating_sub(BRIDGE_HEADER_TERMINATOR.len() - 1);
         }
         let n = match stream.read(&mut chunk).await {
             Ok(n) if n > 0 => n,
             _ => {
-                return if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).into_owned()) };
+                return None; // Never route a truncated request, even when its prefix is valid JSON.
             }
         };
         buf.extend_from_slice(&chunk[..n]);
@@ -353,14 +356,22 @@ async fn read_bridge_request(stream: &mut tokio::net::TcpStream) -> Option<Strin
     }
 }
 
-fn parse_content_length(header_block: &str) -> usize {
-    header_block
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0)
+fn parse_content_length(header_block: &str) -> Option<usize> {
+    let mut length = None;
+    for line in header_block.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            return None; // This minimal bridge supports Content-Length framing only.
+        }
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            if length.is_some() || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            length = Some(value.parse::<usize>().ok()?);
+        }
+    }
+    Some(length.unwrap_or(0))
 }
 
 /// The bridge is a loopback-only control plane for local, non-browser
@@ -463,10 +474,48 @@ mod tests {
 
     #[test]
     fn content_length_parsing_tolerates_case_and_whitespace() {
-        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\nContent-Length: 12\r\n\r\n"), 12);
-        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\ncontent-length:  7\r\n\r\n"), 7);
-        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\nContent-Length: bogus\r\n\r\n"), 0);
-        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\n\r\n"), 0);
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\nContent-Length: 12\r\n\r\n"), Some(12));
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\ncontent-length:  7\r\n\r\n"), Some(7));
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\nContent-Length: bogus\r\n\r\n"), None);
+        assert_eq!(parse_content_length("POST /x HTTP/1.1\r\n\r\n"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn bridge_reads_complete_request_without_waiting_for_client_close() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_bridge_request(&mut stream)).await
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        client.write_all(b"POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}").await.unwrap();
+        let request = reader.await.unwrap().expect("complete requests must not wait for EOF").unwrap();
+        assert!(request.ends_with("{}"));
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_truncated_and_oversized_bodies() {
+        for request in [
+            "POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}",
+            "POST /x HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n",
+            "POST /x HTTP/1.1\r\nContent-Length: bogus\r\n\r\n{}",
+            "POST /x HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}",
+            "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reader = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), read_bridge_request(&mut stream)).await
+            });
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            client.write_all(request.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert!(reader.await.unwrap().expect("malformed requests must terminate").is_none());
+        }
     }
 
     #[tokio::test]
