@@ -4927,15 +4927,45 @@ impl AppState {
     }
 
     pub async fn remove_connection_pools(&self, connection_id: &str) {
+        self.rollback_manual_transaction_sessions(connection_id).await;
         let removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
         self.pool_routing_control().close_removed(removed).await;
     }
 
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
+        self.rollback_manual_transaction_sessions(connection_id).await;
         let removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
         self.pool_routing_control().close_removed_in_background(removed);
+    }
+
+    /// Close and roll back every manual-transaction session of a connection
+    /// before its pools are drained. The transaction sessions hold dedicated
+    /// connections outside the pools being removed; without this the session
+    /// map survives a user disconnect with open transactions, and a later
+    /// reconnect/execution could observe or reuse the stale snapshot state.
+    /// Errors are logged and the session is dropped regardless: pool removal
+    /// is already the caller's decision.
+    async fn rollback_manual_transaction_sessions(&self, connection_id: &str) {
+        let sessions: Vec<(String, TransactionSession)> = {
+            let mut map = self.transaction_sessions.write().await;
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, session)| session.connection_id == connection_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            keys.into_iter().filter_map(|id| map.remove(&id).map(|session| (id, session))).collect()
+        };
+        for (session_id, session) in sessions {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut conn = session.connection.lock().await;
+                crate::query::rollback_manual_txn_connection(&mut conn).await
+            }).await;
+            if !matches!(outcome, Ok(Ok(()))) {
+                log::warn!("[connection:manual-txn:rollback-on-disconnect] session={} cleanup failed or timed out", session_id);
+            }
+        }
     }
 
     pub async fn invalidate_agent_pool_if_current(

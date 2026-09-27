@@ -1876,7 +1876,7 @@ async fn do_execute_typed(
             )
             .await?;
             let execution_cancel_token = if options.await_cancel_completion { None } else { cancel_token };
-            wait_for_result_opt(
+            let statement_result = wait_for_result_opt(
                 execution_cancel_token,
                 query_timeout,
                 db::mysql::execute_query_on_conn_with_limits(
@@ -1891,7 +1891,37 @@ async fn do_execute_typed(
                 ),
             )
             .await
-            .map(|result| result.result)
+            .map(|result| result.result);
+
+            // Client-session pools hold one connection for the whole tab and
+            // skip COM_RESET_CONNECTION on return so session state survives
+            // across executions. A single-statement BEGIN / START TRANSACTION
+            // would therefore leave its transaction open and pin the
+            // connection's REPEATABLE READ read view, so every later
+            // auto-commit query in the tab would keep reading the same stale
+            // snapshot until the connection was closed. Clear it here, exactly
+            // like the multi-statement MySQL path does, so each execution
+            // restores the auto-commit contract (ROLLBACK is a server no-op
+            // when no transaction is open).
+            if statement_result.as_ref().err().is_some_and(|error| {
+                error == QUERY_CANCELED
+                    || matches!(pool_error_action(pool_db_type, error), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)
+            }) {
+                // A cancelled read may leave unread protocol packets; discard rather than issue SQL.
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;
+                state.remove_pool_by_key(pool_key).await;
+            } else if p.is_client_session_pool() {
+                if let Err(error) = db::mysql::rollback_open_transaction(&mut conn).await {
+                    log::warn!(
+                        "[query][mysql] trace_id={} open_txn_rollback_failed error={}",
+                        options.execution_id.as_deref().unwrap_or_default(),
+                        error
+                    );
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;
+                    state.remove_pool_by_key(pool_key).await;
+                }
+            }
+            statement_result
         }
         PoolKind::Postgres(p) => {
             let p = p.clone();
@@ -3582,6 +3612,44 @@ async fn execute_multi_mysql(
     .await;
     let statements_ms = statements_started_at.elapsed().as_millis();
     drop(executor);
+
+    if matches!(error_action, Some(PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)) {
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;
+        state.remove_pool_by_key(pool_key).await;
+        return Ok(results);
+    }
+
+    // Tab-scoped single-connection pools disable COM_RESET_CONNECTION on return
+    // (to preserve session state like temporary tables), so an open transaction
+    // left on the connection — a user-typed BEGIN/START TRANSACTION without
+    // COMMIT, or a canceled/aborted batch that skipped its cleanup — would pin
+    // the REPEATABLE READ snapshot for every later auto-commit query on that
+    // tab, making the tab read stale rows until disconnect. Closing any open
+    // transaction before returning the connection restores the auto-commit
+    // contract; ROLLBACK on an already-committed/implicit transaction is a
+    // server no-op, and a failure here only discards this connection.
+    {
+        let rollback_started_at = std::time::Instant::now();
+        match db::mysql::rollback_open_transaction(&mut conn).await {
+            Ok(()) => {
+                if rollback_started_at.elapsed() > std::time::Duration::from_millis(5) {
+                    log::info!(
+                        "[query][mysql-batch] trace_id={} open_txn_rollback_ms={}",
+                        trace_id,
+                        rollback_started_at.elapsed().as_millis()
+                    );
+                }
+            }
+            Err(error) => {
+                // A failed ROLLBACK leaves the transaction state unknown: drop
+                // the connection instead of returning it to the session pool.
+                log::warn!("[query][mysql-batch] trace_id={} open_txn_rollback_failed error={}", trace_id, error);
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;
+                state.remove_pool_by_key(pool_key).await;
+                return Ok(results);
+            }
+        }
+    }
 
     log::info!(
         "[query][mysql-batch] trace_id={} checkout_ms={} catalog_ms={} statements_ms={} total_ms={} result_count={} row_counts={:?}",
@@ -5566,7 +5634,7 @@ where
     stream_result
 }
 
-async fn rollback_manual_txn_connection(conn: &mut TxnConnection) -> Result<(), String> {
+pub(crate) async fn rollback_manual_txn_connection(conn: &mut TxnConnection) -> Result<(), String> {
     rollback_manual_txn_connection_with_postgres_timeout(conn, None).await
 }
 
