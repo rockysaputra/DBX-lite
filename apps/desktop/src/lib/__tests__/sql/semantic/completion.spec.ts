@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSqlCompletionItemsFromContext, getSqlCompletionContext, type SqlCompletionColumn, type SqlCompletionProviderInput } from "@/lib/sql/sqlCompletion";
+import { buildSqlCompletionItemsFromContext, getSqlCompletionContext, prepareSqlCompletionReplacement, type SqlCompletionColumn, type SqlCompletionProviderInput } from "@/lib/sql/sqlCompletion";
 import { sqlCompletionContextFromSemantic, sqlSemanticLocalColumnsByTable } from "@/lib/sql/semantic/completion";
 import { buildSqlSemanticModel } from "@/lib/sql/semantic/model";
 import { sqlFixtureCursor } from "@/lib/sql/semantic/fixtures";
@@ -535,6 +535,118 @@ FROM (
     const { items } = semanticCompletion("INSERT INTO users (|", { columnsByTable });
 
     expect(items.filter((item) => item.type === "column")).toEqual(expect.arrayContaining([expect.objectContaining({ label: "id", apply: "id", batchSelectionMode: "insert" }), expect.objectContaining({ label: "name", apply: "name", batchSelectionMode: "insert" })]));
+  });
+
+  describe("INSERT target column lists that already have a closing parenthesis", () => {
+    const orgColumns = new Map<string, SqlCompletionColumn[]>([
+      ["organization_user", ["organization_id", "user_id", "role"].map((name) => ({ name, table: "organization_user", schema: "public" }))],
+      ["users", [{ name: "email", table: "users", schema: "public" }]],
+    ]);
+    const columnLabels = (items: ReturnType<typeof semanticCompletion>["items"]) => items.filter((item) => item.type === "column").map((item) => item.label);
+
+    it.each([
+      ["completed list, cursor after comma", "INSERT INTO organization_user (organization_id,|) VALUES (1,23)", ["organization_id", "user_id", "role"]],
+      ["empty list", "INSERT INTO organization_user (|) VALUES (1,23)", ["organization_id", "user_id", "role"]],
+      ["cursor before an existing column", "INSERT INTO organization_user (|organization_id,user_id) VALUES (1,23)", ["organization_id", "user_id", "role"]],
+      ["completed list, cursor after last column", "INSERT INTO organization_user (organization_id,user_id|) VALUES (1,23)", ["user_id"]],
+      ["partially typed identifier", "INSERT INTO organization_user (org|) VALUES (1,23)", ["organization_id"]],
+      ["cursor inside an identifier", "INSERT INTO organization_user (organi|zation_id) VALUES (1,23)", ["organization_id"]],
+      ["after the supplied SELECT statement", "SELECT * FROM users WHERE email = 'a';\n\nINSERT INTO organization_user (organization_id,|) VALUES (1,23);", ["organization_id", "user_id", "role"]],
+    ])("offers only target-table batch-selectable columns: %s", (_name, marked, expected) => {
+      const { context, items } = semanticCompletion(marked, { columnsByTable: orgColumns }, { databaseType: "postgres", dialect: "postgres" });
+
+      expect(context.contextKind).toBe("column");
+      expect(context.insertTable).toBe("organization_user");
+      expect(context.exclusiveColumnSuggestions).toBe(true);
+      const columns = items.filter((item) => item.type === "column");
+      expect(columns.map((item) => item.label).sort()).toEqual([...expected].sort());
+      expect(columns.every((item) => item.batchSelectionMode === "insert")).toBe(true);
+    });
+
+    it("keeps the insert target for a legacy-only context (semantic model absent)", () => {
+      const { sql, cursor } = sqlFixtureCursor("INSERT INTO organization_user (organization_id,user_id|) VALUES (1,23)");
+      const context = getSqlCompletionContext(sql, cursor, { databaseType: "postgres" });
+
+      expect(context.insertTable).toBe("organization_user");
+      expect(context.suggestColumns).toBe(true);
+    });
+
+    it("quotes PostgreSQL identifiers that need it and resolves qualified quoted targets", () => {
+      const columnsByTable = new Map<string, SqlCompletionColumn[]>([
+        [
+          "Order Details",
+          [
+            { name: "User Name", table: "Order Details", schema: "public" },
+            { name: "qty", table: "Order Details", schema: "public" },
+          ],
+        ],
+      ]);
+
+      const { context, items } = semanticCompletion('INSERT INTO "public"."Order Details" ("Us|") VALUES (1)', { columnsByTable }, { databaseType: "postgres", dialect: "postgres" });
+
+      expect(context.insertTable).toBe("Order Details");
+      expect(context.insertSchema).toBe("public");
+      expect(items.find((item) => item.type === "column" && item.label === "User Name")?.apply).toBe('"User Name"');
+    });
+
+    it("quotes MySQL identifiers that need it and resolves qualified backtick targets", () => {
+      const columnsByTable = new Map<string, SqlCompletionColumn[]>([
+        [
+          "order details",
+          [
+            { name: "user name", table: "order details", schema: "shop" },
+            { name: "qty", table: "order details", schema: "shop" },
+          ],
+        ],
+      ]);
+
+      const { context, items } = semanticCompletion("INSERT INTO `shop`.`order details` (qty, `us|`) VALUES (1, 2)", { columnsByTable }, { databaseType: "mysql", dialect: "mysql" });
+
+      expect(context.insertTable).toBe("order details");
+      expect(context.insertSchema).toBe("shop");
+      expect(items.find((item) => item.type === "column" && item.label === "user name")?.apply).toBe("`user name`");
+    });
+
+    it("does not offer target-only columns inside VALUES", () => {
+      const { context, items } = semanticCompletion("INSERT INTO organization_user (organization_id,user_id) VALUES (|)", { columnsByTable: orgColumns }, { databaseType: "postgres", dialect: "postgres" });
+
+      expect(context.exclusiveColumnSuggestions).toBe(false);
+      expect(items.filter((item) => item.type === "column" && item.batchSelectionMode === "insert")).toEqual([]);
+    });
+
+    it("does not offer target-only columns in an INSERT ... SELECT source", () => {
+      const { items } = semanticCompletion("INSERT INTO organization_user (organization_id) SELECT | FROM users", { columnsByTable: orgColumns }, { databaseType: "postgres", dialect: "postgres" });
+
+      expect(columnLabels(items)).not.toContain("organization_id");
+      expect(items.filter((item) => item.type === "column" && item.batchSelectionMode === "insert")).toEqual([]);
+    });
+
+    it("keeps quoted target columns matchable against the typed opening quote", () => {
+      const columnsByTable = new Map<string, SqlCompletionColumn[]>([["Order Details", [{ name: "User Name", table: "Order Details", schema: "public" }]]]);
+      const { sql, cursor, context, items } = semanticCompletion('INSERT INTO "public"."Order Details" ("Us|") VALUES (1)', { columnsByTable }, { databaseType: "postgres", dialect: "postgres" });
+      const replacement = prepareSqlCompletionReplacement(sql, cursor, context, items);
+
+      expect(sql.slice(replacement.from, cursor)).toBe('"Us');
+      expect(replacement.items.find((item) => item.type === "column")).toEqual(expect.objectContaining({ label: "User Name", filterText: '"User Name', apply: '"User Name"' }));
+    });
+
+    it("lists each target column once when the same table is cached under two keys", () => {
+      const columns = ["User Name", "qty"].map((name) => ({ name, table: "Order Details", schema: "public" }));
+      const columnsByTable = new Map<string, SqlCompletionColumn[]>([
+        ["public.Order Details", columns],
+        ["public.Order Details:quoted:s=1:t=1", columns],
+      ]);
+      const { items } = semanticCompletion('INSERT INTO "public"."Order Details" (|) VALUES (1)', { columnsByTable }, { databaseType: "postgres", dialect: "postgres" });
+
+      expect(columnLabels(items)).toEqual(["User Name", "qty"]);
+      expect(items.filter((item) => item.type === "column").map((item) => item.apply)).toEqual(['"User Name"', "qty"]);
+    });
+
+    it("keeps SELECT column completion", () => {
+      const { items } = semanticCompletion("SELECT | FROM users", { columnsByTable: orgColumns }, { databaseType: "postgres", dialect: "postgres" });
+
+      expect(columnLabels(items)).toContain("email");
+    });
   });
 
   it("uses the configured keyword case for INSERT all-column snippets", () => {

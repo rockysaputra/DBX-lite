@@ -1317,6 +1317,8 @@ export interface SqlCompletionItem {
   batchSelectionMode?: "select" | "insert";
   /** Qualifier to prepend to every batch-selected column after the first one. */
   batchSelectionQualifier?: string;
+  /** INSERT all-columns row: accepted like a batch so an existing `)` or row source is kept. */
+  insertAllColumns?: { columns: string; count: number };
 }
 
 export function shouldChainSqlCompletionAfterAccept(item: { type?: string; apply?: string }): boolean {
@@ -1381,6 +1383,7 @@ export interface SqlCompletionContext {
   insertTable?: string;
   insertDatabase?: string;
   insertSchema?: string;
+  insertTableQuoted?: boolean;
   statementKind: SqlStatementKind;
   tableTriggerWord?: string;
   isGroupBy: boolean;
@@ -1422,6 +1425,9 @@ export function prepareSqlCompletionReplacement(sql: string, cursor: number, con
         const escaped = apply.replaceAll(closingQuote, closingQuote + closingQuote);
         prepared = { ...prepared, apply: `${sql[from]}${escaped}${closingQuote}` };
       }
+      // The editor filters against the typed text from `from`, which starts with
+      // the opening quote; without it every column would be filtered out.
+      if (item.type === "column") prepared = { ...prepared, filterText: `${sql[from]}${item.filterText ?? item.label}` };
       return replaceClosingQuote && !prepared.replaceClosingQuote ? { ...prepared, replaceClosingQuote } : prepared;
     }),
   };
@@ -2349,6 +2355,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
     insertTable: insertInfo?.table,
     insertDatabase: insertInfo?.database,
     insertSchema: insertInfo?.schema,
+    insertTableQuoted: insertInfo?.tableQuoted,
     statementKind,
     tableTriggerWord: lastWord || undefined,
     isGroupBy: isInGroupByContext(beforeCursor),
@@ -2719,7 +2726,7 @@ function detectComparisonLeftColumn(beforeCursor: string): string | undefined {
   return match?.[1];
 }
 
-function detectInsertColumnListContext(beforeCursor: string): { table: string; database?: string; schema?: string } | null {
+function detectInsertColumnListContext(beforeCursor: string): { table: string; database?: string; schema?: string; tableQuoted: boolean } | null {
   // Keep quoted identifiers intact so schema/table targets resolve to their
   // real names instead of placeholder string contents.
   const cleaned = beforeCursor.replace(/'[^']*'/g, "''");
@@ -2736,6 +2743,7 @@ function detectInsertColumnListContext(beforeCursor: string): { table: string; d
     table,
     database: parts.length >= 3 ? parts[parts.length - 3] : undefined,
     schema: parts.length >= 2 ? parts[parts.length - 2] : undefined,
+    tableQuoted: isQuotedIdentifier(splitQualifiedNameRawParts(fullTable).pop()),
   };
 }
 
@@ -4095,6 +4103,7 @@ function buildInsertAllColumnItems(context: SqlCompletionContext, columnsByTable
       type: "snippet" as const,
       detail: `${countText}: ${preview.length > 60 ? preview.slice(0, 57) + "..." : preview}`,
       apply: expansion,
+      insertAllColumns: { columns: columnList, count: columns.length },
       boost: 2450 + selectAllColumnItemPrefixBoost(label, { name: context.insertTable, schema: context.insertSchema }, columns, context.prefix),
     },
   ];
@@ -4480,11 +4489,19 @@ function columnsForInsertTarget(context: SqlCompletionContext, columnsByTable: M
   const schemaKey = context.insertSchema ? normalizeIdentifierPart(context.insertSchema) : undefined;
   const databaseKey = context.insertDatabase ? normalizeIdentifierPart(context.insertDatabase) : undefined;
   const qualifiedKey = schemaKey ? normalizeCompletionKey(`${context.insertDatabase ? `${context.insertDatabase}.` : ""}${context.insertSchema}.${context.insertTable}`) : undefined;
-  return collectCompletionColumns(columnsByTable).filter((column) => {
+  // The target is one table; the same listing cached under two keys (for
+  // example quoted and unquoted lookups) must not look like duplicate names.
+  const matching = collectCompletionColumns(columnsByTable).filter((column) => {
     if (normalizeIdentifierPart(column.table) !== tableKey) return false;
-    if (!schemaKey) return true;
-    if (!databaseKey && column.schema && normalizeIdentifierPart(column.schema) === schemaKey) return true;
-    return !!qualifiedKey && normalizeCompletionKey(column.key) === qualifiedKey;
+    return !schemaKey || (!databaseKey && !!column.schema && normalizeIdentifierPart(column.schema) === schemaKey) || (!!qualifiedKey && normalizeCompletionKey(column.key) === qualifiedKey);
+  });
+  // Without a schema the target must be one table: never merge same-named tables of several schemas.
+  if (!schemaKey && new Set(matching.map((column) => column.schema?.toLowerCase()).filter(Boolean)).size > 1) return [];
+  const seen = new Set<string>();
+  return matching.filter((column) => {
+    if (seen.has(column.name)) return false;
+    seen.add(column.name);
+    return true;
   });
 }
 

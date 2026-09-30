@@ -141,7 +141,7 @@ import { buildQueryEditorLineNumbersExtension, createQueryEditorLineNumberAlignm
 import { searchKeymapWithoutModD } from "@/lib/editor/codemirrorSearchKeymap";
 import { defaultKeymapForGlobalShortcuts } from "@/lib/editor/codemirrorDefaultKeymap";
 import { appendSqlCompletionSpace } from "@/lib/editor/sqlCompletionInsertion";
-import { batchColumnSelectionColumnList, batchColumnSelectionInsertReplacement, batchColumnSelectionReplaceTo, isBatchColumnSelectionCompletionActive, shouldResolveSqlColumnCompletion } from "@/lib/editor/batchColumnSelection";
+import { batchColumnSelectionColumnList, batchColumnSelectionInsertReplacement, batchColumnSelectionReplaceTo, insertColumnIdentifierEnd, isBatchColumnSelectionCompletionActive, shouldResolveSqlColumnCompletion } from "@/lib/editor/batchColumnSelection";
 import { compareSqlCompletions, completionLabelPresentation } from "@/lib/editor/sqlCompletionPresentation";
 import { clampEditorFontSize, createEditorWheelZoomGestureGuard, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editor/editorZoom";
 import { enabledSqlShortcutActions, resolveSqlShortcutTemplate } from "@/lib/sql/sqlShortcutActions";
@@ -4244,6 +4244,7 @@ function applyBatchColumnSelection(view: EditorViewType, item: BatchColumnSelect
   if (session.mode === "insert") {
     const replacement = batchColumnSelectionInsertReplacement({
       document: view.state.doc.toString(),
+      from,
       to,
       columns,
       valuesKeyword: settingsStore.editorSettings.sqlFormatter.keywordCase === "lower" ? "values" : "VALUES",
@@ -4406,6 +4407,33 @@ function shouldApplyCompletionAsSnippet(item: QueryCompletionItem): boolean {
   return item.type === "snippet" || item.type === "function";
 }
 
+// An INSERT column pick replaces the whole identifier being edited, so a
+// corrected name does not keep the old suffix or closing quote. Only a small
+// window of the current line is inspected.
+function insertColumnReplaceTo(view: EditorViewType, from: number, to: number): number {
+  const windowEnd = Math.min(view.state.doc.lineAt(to).to, to + 512);
+  return from + insertColumnIdentifierEnd(view.state.sliceDoc(from, windowEnd), 0, to - from);
+}
+
+const INSERT_TARGET_LOOKUP_LIMIT = 20;
+
+// The one schema-qualified table a schema-less INSERT target can mean, or undefined
+// when nothing matches, several schemas match, or the listing may be truncated.
+function uniqueInsertTarget(tables: SqlCompletionTable[], name: string, quoted: boolean, database: string): SqlCompletionTable | undefined {
+  if (tables.length >= INSERT_TARGET_LOOKUP_LIMIT) return undefined;
+  const postgres = props.databaseType === "postgres";
+  // PostgreSQL folds an unquoted name to lower case; a quoted one is exact.
+  const wanted = postgres ? (quoted ? name : name.toLowerCase()) : name.toLowerCase();
+  const matches = tables.filter((table) => table.schema && (postgres ? table.name === wanted : table.name.toLowerCase() === wanted) && (!table.database || table.database === database) && (!table.catalog || !props.catalog || table.catalog === props.catalog));
+  const schemas = new Set(matches.map((table) => (postgres ? table.schema : table.schema!.toLowerCase())));
+  return schemas.size === 1 ? matches[0] : undefined;
+}
+
+// A reference to the INSERT target table is resolved by the INSERT path only, never by the generic reference path.
+function isInsertTargetReference(completionContext: { insertTable?: string }, table: { name: string }): boolean {
+  return !!completionContext.insertTable && table.name.toLowerCase() === completionContext.insertTable.toLowerCase();
+}
+
 function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectionActionItem) {
   const filterText = "filterText" in item && typeof item.filterText === "string" ? item.filterText : undefined;
   const labelPresentation = completionLabelPresentation(item.label, filterText);
@@ -4440,6 +4468,23 @@ function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectio
       apply(view: EditorViewType, completionItem: unknown, from: number, to: number) {
         record();
         markCompletionAccepted(item);
+        const insertAll = "insertAllColumns" in item ? item.insertAllColumns : undefined;
+        if (insertAll && typeof originalApply === "function") {
+          // Same acceptance as the checked-columns batch: keep an existing `)` and row source.
+          const replacement = batchColumnSelectionInsertReplacement({
+            document: view.state.doc.toString(),
+            from,
+            to,
+            columns: insertAll.columns,
+            valuesKeyword: settingsStore.editorSettings.sqlFormatter.keywordCase === "lower" ? "values" : "VALUES",
+            valueCount: insertAll.count,
+          });
+          const snippet = codeMirrorSnippetCompletion(replacement.insert, { label: item.label });
+          if (typeof snippet.apply === "function") {
+            snippet.apply(view, snippet, from, replacement.replaceTo);
+            return;
+          }
+        }
         const replaceTo = "replaceClosingQuote" in item && item.replaceClosingQuote === view.state.sliceDoc(to, to + 1) ? to + 1 : to;
         if (typeof originalApply === "function") {
           originalApply(view, completionItem as never, from, replaceTo);
@@ -4469,7 +4514,7 @@ function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectio
     apply(view: EditorViewType, _completionItem: unknown, from: number, to: number) {
       record();
       markCompletionAccepted(item);
-      const replaceTo = "replaceClosingQuote" in item && item.replaceClosingQuote === view.state.sliceDoc(to, to + 1) ? to + 1 : to;
+      const replaceTo = "batchSelectionMode" in item && item.batchSelectionMode === "insert" ? insertColumnReplaceTo(view, from, to) : "replaceClosingQuote" in item && item.replaceClosingQuote === view.state.sliceDoc(to, to + 1) ? to + 1 : to;
       const insert = appendSqlCompletionSpace(item.apply ?? item.label, {
         enabled: ("appendSpace" in item && item.appendSpace === true) || (shouldInsertSqlCompletionSpace() && settingsStore.editorSettings.insertSpaceAfterCompletion),
         itemType: item.type,
@@ -5019,9 +5064,13 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
   if (completionContext.insertTable) {
     const insertDatabase = (supportsDatabaseSchemaQualifierCompletion() ? completionContext.insertDatabase : undefined) ?? scope.database;
     const insertSchema = completionContext.insertSchema ?? scope.schema;
-    const insertColumns = usesOracleSessionCompletionColumns(insertSchema) ? [] : connectionStore.lookupLocalCompletionColumns(props.connectionId, insertDatabase, completionContext.insertTable, insertSchema, props.catalog);
+    const insertKey = completionCacheKey({ name: completionContext.insertTable, database: completionContext.insertDatabase, schema: insertSchema }, scope);
+    const sessionScoped = usesOracleSessionCompletionColumns(insertSchema);
+    const localInsertColumns = sessionScoped ? [] : connectionStore.lookupLocalCompletionColumns(props.connectionId, insertDatabase, completionContext.insertTable, insertSchema, props.catalog);
+    // Columns resolved by an explicit request without a selected schema live in the editor cache.
+    const insertColumns = sessionScoped || localInsertColumns.length > 0 ? localInsertColumns : (cachedColumnsByTable.get(insertKey) ?? []);
     if (insertColumns.length > 0) {
-      columnsByTable.set(completionCacheKey({ name: completionContext.insertTable, database: completionContext.insertDatabase, schema: insertSchema }, scope), insertColumns);
+      columnsByTable.set(insertKey, insertColumns);
     }
   }
 
@@ -5054,6 +5103,7 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
 
   const cteDefs = extractCteDefinitions(fullDoc);
   for (const refTable of completionContext.referencedTables) {
+    if (isInsertTargetReference(completionContext, refTable)) continue;
     if (refTable.columns?.length) {
       columnsByTable.set(
         refTable.name,
@@ -5200,7 +5250,10 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
     void refreshCompletionColumnsForEditor(connectionId, insertDatabase, insertTable, completionContext.insertSchema ?? scope.schema)
       .then((columns) => {
         const insertSchema = completionContext.insertSchema ?? scope.schema;
-        cachedColumnsByTable.set(completionCacheKey({ name: insertTable, database: completionContext.insertDatabase, schema: insertSchema }, scope), columns);
+        const insertKey = completionCacheKey({ name: insertTable, database: completionContext.insertDatabase, schema: insertSchema }, scope);
+        // A schema-less request can come back empty; keep columns resolved by the explicit request.
+        if (columns.length === 0 && cachedColumnsByTable.get(insertKey)?.length) return;
+        cachedColumnsByTable.set(insertKey, columns);
       })
       .catch(() => {});
   }
@@ -5218,6 +5271,7 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
   }
   if (!onDemandOnlyColumns && !tableNameCompletion) {
     for (const refTable of completionContext.referencedTables) {
+      if (isInsertTargetReference(completionContext, refTable)) continue;
       if (isVirtualCompletionTableReference(refTable)) continue;
       if (refTable.columns && refTable.columns.length > 0) continue;
       const cacheKey = completionCacheKey(refTable, scope);
@@ -5348,12 +5402,26 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   let insertColumnsByTable = new Map<string, SqlCompletionColumn[]>();
   if (completionContext.insertTable) {
     try {
+      const insertTable = completionContext.insertTable;
       const insertDatabase = (supportsDatabaseSchemaQualifierCompletion() ? completionContext.insertDatabase : undefined) ?? scope.database;
-      const insertCols = await listCompletionColumnsForEditor(props.connectionId!, insertDatabase, completionContext.insertTable, completionContext.insertSchema ?? scope.schema);
+      const insertSchema = completionContext.insertSchema ?? scope.schema;
+      const insertKey = completionCacheKey({ name: insertTable, database: completionContext.insertDatabase, schema: insertSchema }, scope);
+      let insertCols = await listCompletionColumnsForEditor(props.connectionId!, insertDatabase, insertTable, insertSchema);
       if (epoch !== completionEpoch) return null;
+      if (insertCols.length === 0 && !insertSchema && isSchemaAware(props.databaseType)) {
+        // Schema-aware metadata needs a schema and none is selected. Metadata list order is not the
+        // server's search_path, so resolve only a target that exactly one schema of this database has.
+        const candidates = await connectionStore.listCompletionTables(props.connectionId!, insertDatabase, insertTable, INSERT_TARGET_LOOKUP_LIMIT, undefined, false, scope.schema, props.catalog);
+        if (epoch !== completionEpoch) return null;
+        const target = uniqueInsertTarget(candidates, insertTable, completionContext.insertTableQuoted === true, insertDatabase);
+        if (target?.schema) {
+          insertCols = await listCompletionColumnsForEditor(props.connectionId!, insertDatabase, target.name, target.schema, props.catalog, { nameQuoted: true, schemaQuoted: true });
+          if (epoch !== completionEpoch) return null;
+          // The local (typing) path looks the target up under its unresolved key.
+          if (insertCols.length > 0) cachedColumnsByTable.set(insertKey, insertCols);
+        }
+      }
       if (insertCols.length > 0) {
-        const insertSchema = completionContext.insertSchema ?? scope.schema;
-        const insertKey = completionCacheKey({ name: completionContext.insertTable, database: completionContext.insertDatabase, schema: insertSchema }, scope);
         insertColumnsByTable.set(insertKey, insertCols);
       }
     } catch {
@@ -5449,16 +5517,18 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   }
 
   // Collect referenced tables — enrich with schema from filtered table lookup
-  let refs = completionContext.referencedTables.map((rt) => {
-    if (usesOracleSessionCompletionColumns(rt.schema)) return rt;
-    if (!rt.schema) {
-      const cached = tables.find((t) => t.name.toLowerCase() === rt.name.toLowerCase());
-      if (cached && cached.schema) {
-        return { ...rt, schema: cached.schema };
+  let refs = completionContext.referencedTables
+    .filter((rt) => !isInsertTargetReference(completionContext, rt))
+    .map((rt) => {
+      if (usesOracleSessionCompletionColumns(rt.schema)) return rt;
+      if (!rt.schema) {
+        const cached = tables.find((t) => t.name.toLowerCase() === rt.name.toLowerCase());
+        if (cached && cached.schema) {
+          return { ...rt, schema: cached.schema };
+        }
       }
-    }
-    return rt;
-  });
+      return rt;
+    });
   const unresolvedRefs = refs.filter((rt) => !usesOracleSessionCompletionColumns(rt.schema) && !rt.schema && !rt.columns && !isVirtualCompletionTableReference(rt));
   if (!localOnlyMetadata && unresolvedRefs.length > 0) {
     const lookupGroups = await Promise.all(
