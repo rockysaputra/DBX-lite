@@ -15,6 +15,8 @@ interface RetryCompletionAcceptanceOptions {
   onSettled?: () => void;
   /** Called before each retry; when an IME composition started while waiting, the queued acceptance must be dropped instead of fighting the IME. */
   isComposing?: () => boolean;
+  /** Also wait while the completion is still loading (an explicitly requested popup). */
+  waitWhilePending?: boolean;
 }
 
 interface CompletionAcceptanceAttempt {
@@ -31,7 +33,8 @@ export function acceptSelectedOrFirstCompletion(view: EditorView, acceptCompleti
 }
 
 export function acceptSelectedCompletionWithRetry(view: EditorView, options: RetryCompletionAcceptanceOptions): CompletionAcceptanceAttempt {
-  if (options.completionStatus(view.state) !== "active") return { handled: false };
+  const canAccept = (status: "active" | "pending" | null) => status === "active" || (status === "pending" && options.waitWhilePending === true);
+  if (!canAccept(options.completionStatus(view.state))) return { handled: false };
   if (acceptSelectedOrFirstCompletion(view, options.acceptCompletion, options.selectedCompletionIndex, options.selectFirstCompletion)) return { handled: true };
 
   const initialDoc = view.state.doc;
@@ -66,7 +69,7 @@ export function acceptSelectedCompletionWithRetry(view: EditorView, options: Ret
     }
 
     const completionStatus = options.completionStatus(view.state);
-    if (completionStatus === "active" && acceptSelectedOrFirstCompletion(view, options.acceptCompletion, options.selectedCompletionIndex, options.selectFirstCompletion)) {
+    if (canAccept(completionStatus) && acceptSelectedOrFirstCompletion(view, options.acceptCompletion, options.selectedCompletionIndex, options.selectFirstCompletion)) {
       settle();
       return;
     }

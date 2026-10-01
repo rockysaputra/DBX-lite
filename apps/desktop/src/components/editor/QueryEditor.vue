@@ -634,6 +634,8 @@ let codeMirrorDefaultKeymap: readonly import("@codemirror/view").KeyBinding[] | 
 let codeMirrorToggleFold: typeof import("@codemirror/language").toggleFold | null = null;
 let pendingCompletionTabTimer: ReturnType<typeof setTimeout> | null = null;
 let cancelPendingCompletionEnter: (() => void) | null = null;
+// The completion shortcut opened this session: Enter waits for its still-loading popup.
+let explicitCompletionRequested = false;
 let setSqlDiagnosticsEffect: import("@codemirror/state").StateEffectType<SqlSemanticDiagnostic[]> | null = null;
 let setPreviewRangeEffect:
   | import("@codemirror/state").StateEffectType<{
@@ -2348,7 +2350,8 @@ function handleEnter(view: EditorViewType): boolean {
       selectedCompletionIndex: codeMirrorSelectedCompletionIndex,
       selectFirstCompletion: codeMirrorSelectFirstCompletion,
       retryDelayMs: COMPLETION_TAB_RETRY_DELAY_MS,
-      maxWaitMs: COMPLETION_ENTER_MAX_WAIT_MS,
+      maxWaitMs: explicitCompletionRequested ? COMPLETION_TAB_MAX_WAIT_MS : COMPLETION_ENTER_MAX_WAIT_MS,
+      waitWhilePending: explicitCompletionRequested,
       isComposing: () => isEditorComposing(view),
       onUnavailable: () => insertNewlineWithoutCompletion(view),
       onSettled: () => {
@@ -4261,11 +4264,7 @@ function applyBatchColumnSelection(view: EditorViewType, item: BatchColumnSelect
   clearBatchColumnSelectionSession();
   markCompletionAccepted(item);
   if (session.mode === "insert") {
-    const snippet = codeMirrorSnippetCompletion(insert, { label: item.label });
-    if (typeof snippet.apply === "function") {
-      snippet.apply(view, snippet, from, replaceTo);
-      return;
-    }
+    if (applyInsertColumnsSnippet(view, insert, item.label, from, replaceTo)) return;
   }
   view.dispatch({
     changes: { from, to: replaceTo, insert },
@@ -4415,6 +4414,20 @@ function insertColumnReplaceTo(view: EditorViewType, from: number, to: number): 
   return from + insertColumnIdentifierEnd(view.state.sliceDoc(from, windowEnd), 0, to - from);
 }
 
+// CodeMirror's snippet() only sets a selection when the template has fields. A plain
+// column list (existing `)` or row source kept) would leave the caret in front of the
+// inserted columns, so the next typed character lands on their left.
+function applyInsertColumnsSnippet(view: EditorViewType, template: string, label: string, from: number, to: number): boolean {
+  const snippet = codeMirrorSnippetCompletion(template, { label });
+  if (typeof snippet.apply !== "function") return false;
+  const lengthBefore = view.state.doc.length;
+  snippet.apply(view, snippet, from, to);
+  const end = to + view.state.doc.length - lengthBefore;
+  const { main } = view.state.selection;
+  if (main.empty && main.head === from && end > from) view.dispatch({ selection: { anchor: end } });
+  return true;
+}
+
 const INSERT_TARGET_LOOKUP_LIMIT = 20;
 
 // The one schema-qualified table a schema-less INSERT target can mean, or undefined
@@ -4479,11 +4492,7 @@ function completionOptionForItem(item: QueryCompletionItem | BatchColumnSelectio
             valuesKeyword: settingsStore.editorSettings.sqlFormatter.keywordCase === "lower" ? "values" : "VALUES",
             valueCount: insertAll.count,
           });
-          const snippet = codeMirrorSnippetCompletion(replacement.insert, { label: item.label });
-          if (typeof snippet.apply === "function") {
-            snippet.apply(view, snippet, from, replacement.replaceTo);
-            return;
-          }
+          if (applyInsertColumnsSnippet(view, replacement.insert, item.label, from, replacement.replaceTo)) return;
         }
         const replaceTo = "replaceClosingQuote" in item && item.replaceClosingQuote === view.state.sliceDoc(to, to + 1) ? to + 1 : to;
         if (typeof originalApply === "function") {
@@ -4898,7 +4907,14 @@ function isEditorComposing(currentView: EditorViewType): boolean {
 // session would be misclassified as typing and gated for 500ms.
 function triggerSqlCompletion(currentView: EditorViewType): boolean {
   if (!codeMirrorStartCompletion || isEditorComposing(currentView)) return false;
-  return codeMirrorStartCompletion(currentView);
+  return startExplicitCompletion(currentView);
+}
+
+// Ctrl+Space and the completion shortcut: an explicit request, unlike typing.
+function startExplicitCompletion(currentView: EditorViewType): boolean {
+  if (!codeMirrorStartCompletion?.(currentView)) return false;
+  explicitCompletionRequested = true;
+  return true;
 }
 
 function scheduleSqlCompletionStart(currentView: EditorViewType, delayMs = 0) {
@@ -6413,7 +6429,7 @@ onMounted(async () => {
       // Vim must be mounted before DBX/default keymaps so normal-mode keys are handled first.
       vimModeComp.of(vimModeExtension(initialSettings.vimModeEnabled)),
       defaultKeymapComp.of(defaultKeymapExtension()),
-      keymap.of([...searchKeymapWithoutModD(searchKeymap), ...historyKeymap, ...foldKeymap, ...completionKeymap]),
+      keymap.of([...searchKeymapWithoutModD(searchKeymap), ...historyKeymap, ...foldKeymap, ...completionKeymap.map((binding) => (binding.run === startCompletion ? { ...binding, run: startExplicitCompletion } : binding))]),
       sqlLanguageComp.of(buildSqlLanguageExtension()),
       sqlSemanticHighlightComp.of(buildSqlSemanticHighlightExtension()),
       tooltips({ parent: tooltipParent }),
@@ -6524,6 +6540,7 @@ onMounted(async () => {
           const status = codeMirrorCompletionStatus(update.state) ?? null;
           if (status === null) {
             activeCompletionOrigin = null;
+            explicitCompletionRequested = false;
             clearBatchColumnSelectionSession();
           }
         }

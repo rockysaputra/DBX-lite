@@ -1,9 +1,9 @@
 // @vitest-environment happy-dom
 
-import { createApp, h, reactive, type App } from "vue";
+import { createApp, h, nextTick, reactive, type App } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
-import { completionStatus, currentCompletions, setSelectedCompletion } from "@codemirror/autocomplete";
+import { completionStatus, currentCompletions, selectedCompletion, setSelectedCompletion } from "@codemirror/autocomplete";
 import { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseType } from "@/types/database";
@@ -179,6 +179,9 @@ interface MountOptions {
   schema?: string;
   fixture?: "unique" | "ambiguous" | "truncated";
   reversed?: boolean;
+  // Like ContentArea + queryStore: the parent also stores the emitted editor
+  // selection and passes it back as `initialSelection`.
+  controlledSelection?: boolean;
 }
 
 async function mountAt(marked: string, options: MountOptions) {
@@ -189,14 +192,15 @@ async function mountAt(marked: string, options: MountOptions) {
   const sql = marked.slice(0, cursor) + marked.slice(cursor + 1);
   const pinia = createPinia();
   setActivePinia(pinia);
-  const state = reactive({ sql });
+  const state = reactive({ sql, selection: undefined as { anchor: number; head: number } | undefined });
+  const tabId = `insert-columns-${Math.random()}`;
   const host = document.createElement("div");
   document.body.append(host);
   const app: App = createApp({
     render: () =>
       h(QueryEditor, {
         modelValue: state.sql,
-        tabId: `insert-columns-${Math.random()}`,
+        tabId,
         connectionId: "synthetic-connection",
         database: options.database,
         schema: options.schema,
@@ -206,6 +210,14 @@ async function mountAt(marked: string, options: MountOptions) {
         "onUpdate:modelValue": (value: string) => {
           state.sql = value;
         },
+        ...(options.controlledSelection
+          ? {
+              initialSelection: state.selection,
+              onSelectionStateChange: (selection: { anchor: number; head: number }) => {
+                state.selection = selection;
+              },
+            }
+          : {}),
       }),
   });
   app.use(pinia);
@@ -219,7 +231,7 @@ async function mountAt(marked: string, options: MountOptions) {
   const view = EditorView.findFromDOM(host.querySelector(".cm-editor") as HTMLElement)!;
   await vi.waitFor(() => expect(view.state.doc.toString()).toBe(sql));
   view.dispatch({ selection: { anchor: cursor } });
-  return { view, host };
+  return { view, host, state };
 }
 
 function keydown(view: EditorView, init: KeyboardEventInit) {
@@ -442,5 +454,246 @@ describe("mounted QueryEditor: single INSERT column acceptance replaces the whol
     view.dispatch({ effects: setSelectedCompletion(columnIndex(view, label)) });
     expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
     await vi.waitFor(() => expect(view.state.doc.toString()).toBe(expected));
+  });
+});
+
+describe("mounted QueryEditor: typing after an accepted INSERT column", () => {
+  // `|` in the expected text is where the caret must be after acceptance; the next
+  // typed comma has to land there, to the right of the completed column.
+  const PG_CONTROLLED: MountOptions = { ...PG_PUBLIC, controlledSelection: true };
+
+  async function settle() {
+    await nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await nextTick();
+  }
+
+  // Highlight a row with real ArrowDown key events (after the async refresh settled).
+  async function highlightWithArrows(view: EditorView, label: string) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const highlighted = () => {
+      const option = selectedCompletion(view.state);
+      return option ? shownLabel(option) : undefined;
+    };
+    for (let step = 0; step < 20 && highlighted() !== label; step += 1) {
+      expect(keydown(view, { key: "ArrowDown", code: "ArrowDown" }).defaultPrevented).toBe(true);
+    }
+    expect(highlighted()).toBe(label);
+  }
+
+  async function checkWithKeys(view: EditorView, host: HTMLElement, labels: string[]) {
+    for (const label of labels) {
+      await highlightWithArrows(view, label);
+      expect(keydown(view, { key: " ", code: "Space" }).defaultPrevented).toBe(true);
+      await vi.waitFor(
+        () => {
+          expect(completionStatus(view.state)).toBe("active");
+          expect(checkbox(host, label)?.checked).toBe(true);
+        },
+        { timeout: 3000 },
+      );
+    }
+  }
+
+  // A browser keystroke: the character lands at the native DOM caret, and CodeMirror
+  // turns that DOM change into a transaction by offering it to the input handlers
+  // before its default "input.type" insert (@codemirror/view applyDOMChangeInner).
+  function typeAtNativeCaret(view: EditorView, text: string) {
+    keydown(view, { key: text, code: text === "," ? "Comma" : undefined });
+    const domSelection = document.getSelection();
+    expect(domSelection?.focusNode, "native DOM caret").toBeTruthy();
+    const at = view.posAtDOM(domSelection!.focusNode!, domSelection!.focusOffset);
+    const defaultInsert = () => view.state.update({ changes: { from: at, to: at, insert: text }, selection: { anchor: at + text.length }, userEvent: "input.type", scrollIntoView: true });
+    if (!view.state.facet(EditorView.inputHandler).some((handler) => handler(view, at, at, text, defaultInsert))) view.dispatch(defaultInsert());
+  }
+
+  function expectCaret(view: EditorView, state: { sql: string; selection?: { anchor: number; head: number } }, marked: string, check: typeof expect = expect) {
+    const caret = marked.indexOf("|");
+    const doc = marked.slice(0, caret) + marked.slice(caret + 1);
+    check(view.state.doc.toString()).toBe(doc);
+    check(state.sql, "parent v-model").toBe(doc);
+    check(view.state.selection.main.empty, "collapsed caret").toBe(true);
+    check(view.state.selection.main.head, "editor caret").toBe(caret);
+    check(state.selection, "parent-stored selection").toEqual({ anchor: caret, head: caret });
+    const domSelection = document.getSelection();
+    check(view.posAtDOM(domSelection!.focusNode!, domSelection!.focusOffset), "native DOM caret").toBe(caret);
+  }
+
+  async function expectCommaTypedAtCaret(view: EditorView, state: { sql: string; selection?: { anchor: number; head: number } }, marked: string) {
+    // Soft, so a wrong caret still shows where the typed comma ends up.
+    expectCaret(view, state, marked, expect.soft);
+    await settle();
+    expectCaret(view, state, marked, expect.soft);
+    typeAtNativeCaret(view, ",");
+    const typed = marked.replace("|", ",|");
+    await nextTick();
+    expectCaret(view, state, typed);
+  }
+
+  async function open(marked: string, options: MountOptions = PG_CONTROLLED, focus = true) {
+    const mounted = await mountAt(marked, options);
+    if (focus) {
+      // Focused, so CodeMirror writes its selection to the native DOM selection.
+      mounted.view.focus();
+      expect(mounted.view.hasFocus).toBe(true);
+    }
+    await openCompletion(mounted.view);
+    return mounted;
+  }
+
+  it.each<[string, MountOptions, string, string, string]>([
+    ["screenshot: lowercase, no VALUES", PG_CONTROLLED, "insert into organization_user (|)", "organization_id", "insert into organization_user (organization_id|)"],
+    ["existing VALUES", PG_CONTROLLED, "insert into organization_user (|) values (1, 23)", "organization_id", "insert into organization_user (organization_id|) values (1, 23)"],
+    ["partial prefix typo", PG_CONTROLLED, "insert into organization_user (organiz|aton_id) values (1, 23)", "organization_id", "insert into organization_user (organization_id|) values (1, 23)"],
+    ["quoted name", PG_CONTROLLED, 'insert into "public"."Order Details" ("Us|r Nme") values (1)', "User Name", 'insert into "public"."Order Details" ("User Name"|) values (1)'],
+  ])("single item via ArrowDown + Enter, %s", async (_name, options, marked, label, expected) => {
+    const { view, state } = await open(marked, options);
+    await highlightWithArrows(view, label);
+    expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+    await expectCommaTypedAtCaret(view, state, expected);
+  });
+
+  it("single item via Tab, screenshot doc", async () => {
+    const { view, state } = await open("insert into organization_user (|)");
+    await highlightWithArrows(view, "organization_id");
+    keydown(view, { key: "Tab", code: "Tab" });
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+    await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id|)");
+  });
+
+  it.each<[string, string, string[], string]>([
+    ["existing VALUES", "insert into organization_user (|) values (1, 23)", ["organization_id"], "insert into organization_user (organization_id|) values (1, 23)"],
+    ["existing VALUES, two columns", "insert into organization_user (|) values (1, 23)", ["organization_id", "user_id"], "insert into organization_user (organization_id, user_id|) values (1, 23)"],
+    ["a following statement", "insert into organization_user (|)\nselect 1", ["organization_id"], "insert into organization_user (organization_id|)\nselect 1"],
+  ])("checked columns via Space + Enter, %s", async (_name, marked, labels, expected) => {
+    const { view, host, state } = await open(marked);
+    await checkWithKeys(view, host, labels);
+    expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+    await expectCommaTypedAtCaret(view, state, expected);
+  });
+
+  it("checked columns on the screenshot doc select the first VALUES placeholder", async () => {
+    // Unfocused: happy-dom fires selectionchange synchronously when a non-empty DOM
+    // selection is written, re-entering CodeMirror mid-update. Only state is asserted here.
+    const { view, host, state } = await open("insert into organization_user (|)", PG_CONTROLLED, false);
+    await checkWithKeys(view, host, ["organization_id"]);
+    expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+    await settle();
+    const doc = "insert into organization_user (organization_id) VALUES (value)";
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(state.sql).toBe(doc);
+    const placeholder = doc.lastIndexOf("value");
+    expect(view.state.selection.main.from).toBe(placeholder);
+    expect(view.state.selection.main.to).toBe(placeholder + "value".length);
+  });
+
+  it("all-columns row via ArrowDown + Enter keeps the caret after the columns", async () => {
+    const { view, state } = await open("insert into organization_user (|) values (1, 23)");
+    await highlightWithArrows(view, "organization_user.*");
+    expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+    await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id, user_id, role|) values (1, 23)");
+  });
+
+  // Direct Enter: no arrows, no settle wait, the first option is selected on open
+  // (default selectFirstCompletionOnOpen). CodeMirror ignores accept for 75 ms after
+  // the popup opens (interactionDelay), which QueryEditor's Enter retry covers.
+  describe("direct Enter", () => {
+    const MYSQL_CONTROLLED: MountOptions = { ...MYSQL_APP, controlledSelection: true };
+
+    async function mountFocused(marked: string, options: MountOptions) {
+      const mounted = await mountAt(marked, options);
+      mounted.view.focus();
+      expect(mounted.view.hasFocus).toBe(true);
+      return mounted;
+    }
+
+    // One keystroke per macrotask, each at the native DOM caret.
+    async function typeKeys(view: EditorView, text: string) {
+      for (const character of text) {
+        typeAtNativeCaret(view, character);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+
+    // Poll every macrotask so Enter follows the popup's appearance as closely as possible.
+    async function waitUntilPopupVisible(view: EditorView, host: HTMLElement) {
+      const started = Date.now();
+      while (!(currentCompletions(view.state).length > 0 && host.querySelector(".cm-tooltip-autocomplete"))) {
+        if (Date.now() - started > 3000) throw new Error("completion popup did not open");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+
+    // Whether Enter applied the completion synchronously or left it to the retry timer.
+    function pressEnter(view: EditorView) {
+      const before = view.state.doc;
+      const status = completionStatus(view.state);
+      const event = keydown(view, { key: "Enter", code: "Enter" });
+      return { prevented: event.defaultPrevented, status, synchronous: view.state.doc !== before };
+    }
+
+    async function acceptWhenVisible(view: EditorView, host: HTMLElement, ready: boolean) {
+      await waitUntilPopupVisible(view, host);
+      if (ready) await new Promise((resolve) => setTimeout(resolve, 150));
+      const enter = pressEnter(view);
+      expect(enter.prevented).toBe(true);
+      await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull(), { timeout: 3000 });
+      return enter;
+    }
+
+    it.each<[string, MountOptions, boolean]>([
+      ["PG, just visible (Enter retry)", PG_CONTROLLED, false],
+      ["PG, ready popup", PG_CONTROLLED, true],
+      ["MySQL, just visible (Enter retry)", MYSQL_CONTROLLED, false],
+    ])("typed prefix that matches one column, %s", async (_name, options, ready) => {
+      const { view, host, state } = await mountFocused("insert into organization_user (|)", options);
+      await typeKeys(view, "organization_i");
+      const enter = await acceptWhenVisible(view, host, ready);
+      // Just visible: still inside interactionDelay, so the retry branch accepted it.
+      expect(enter.synchronous).toBe(ready);
+      await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id|)");
+    });
+
+    it("Ctrl+Space then immediate Enter while the provider is pending", async () => {
+      const { view, state } = await mountFocused("insert into organization_user (organization_i|)", PG_CONTROLLED);
+      expect(keydown(view, CTRL_SPACE).defaultPrevented).toBe(true);
+      const enter = pressEnter(view);
+      expect(enter.status).toBe("pending");
+      expect(enter.prevented).toBe(true);
+      // Nothing is inserted while the explicit request loads (debounced, ~320 ms here).
+      expect(view.state.doc.toString()).toBe("insert into organization_user (organization_i)");
+      await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull(), { timeout: 3000 });
+      await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id|)");
+    });
+
+    it("typed prefix, Enter before any popup appears still inserts a newline", async () => {
+      // Not an explicit request: Enter must not accept a completion the user never saw.
+      const { view, state } = await mountFocused("insert into organization_user (|)", PG_CONTROLLED);
+      await typeKeys(view, "organization_i");
+      const enter = pressEnter(view);
+      expect(enter.status).toBe("pending");
+      expect(currentCompletions(view.state)).toEqual([]);
+      expect(enter.prevented).toBe(true);
+      await settle();
+      expect(view.state.doc.toString()).toBe("insert into organization_user (organization_i\n)");
+      expect(state.sql).toBe(view.state.doc.toString());
+    });
+
+    it.each<[string, MountOptions]>([
+      ["PG", PG_CONTROLLED],
+      ["MySQL", MYSQL_CONTROLLED],
+    ])("%s chain: organization_id, comma, then user_id, each by typed prefix and Enter", async (_name, options) => {
+      const { view, host, state } = await mountFocused("insert into organization_user (|)", options);
+      await typeKeys(view, "organization_i");
+      await acceptWhenVisible(view, host, false);
+      expectCaret(view, state, "insert into organization_user (organization_id|)");
+      await typeKeys(view, ",user_i");
+      await acceptWhenVisible(view, host, false);
+      await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id,user_id|)");
+    });
   });
 });
