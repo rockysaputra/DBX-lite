@@ -617,6 +617,8 @@ let codeMirrorStartCompletion: typeof import("@codemirror/autocomplete").startCo
 let codeMirrorCloseCompletion: typeof import("@codemirror/autocomplete").closeCompletion | null = null;
 let codeMirrorInsertCompletionText: typeof import("@codemirror/autocomplete").insertCompletionText | null = null;
 let codeMirrorNextSnippetField: typeof import("@codemirror/autocomplete").nextSnippetField | null = null;
+let codeMirrorHasNextSnippetField: typeof import("@codemirror/autocomplete").hasNextSnippetField | null = null;
+let codeMirrorHasPrevSnippetField: typeof import("@codemirror/autocomplete").hasPrevSnippetField | null = null;
 let codeMirrorIndentMore: typeof import("@codemirror/commands").indentMore | null = null;
 let codeMirrorIndentLess: typeof import("@codemirror/commands").indentLess | null = null;
 let codeMirrorCopyLineDown: typeof import("@codemirror/commands").copyLineDown | null = null;
@@ -1798,6 +1800,28 @@ function resyncCaretAfterPaste(view: EditorViewType) {
   if (nudged === null) return;
   requestAnimationFrame(() => {
     if (!view.dom.isConnected || view.state.selection.ranges.length !== 1 || view.state.selection.main.head !== pos || !view.state.selection.main.empty) return;
+    view.dispatch({ selection: EditorSelection.cursor(nudged) });
+    view.dispatch({ selection: EditorSelection.cursor(pos) });
+  });
+}
+
+// An accepted completion rewrites DOM text like a paste, so WebKit can keep typing at the
+// pre-accept position: CodeMirror only forces a DOM selection write after such a rewrite on
+// Chrome/iOS. Same nudge as paste, but as a microtask, so it lands before the next key
+// (WKWebView delivered it ~7 ms after Enter, before any frame) and outside the update.
+// It nudges around the caret as it is then: an accept may correct its own caret in a
+// follow-up dispatch (applyInsertColumnsSnippet).
+function resyncCaretAfterCompletion(view: EditorViewType) {
+  const EditorSelection = codeMirrorEditorSelection;
+  if (!EditorSelection) return;
+  const doc = view.state.doc;
+  queueMicrotask(() => {
+    // A newer edit, an IME composition, snippet fields or a chained completion own the caret now.
+    if (!view.dom.isConnected || view.state.doc !== doc || isEditorComposing(view)) return;
+    if (codeMirrorHasNextSnippetField?.(view.state) || codeMirrorHasPrevSnippetField?.(view.state) || codeMirrorCompletionStatus?.(view.state)) return;
+    const pos = view.state.selection.main.head;
+    const nudged = computePasteCaretResyncTarget(view.state.selection, doc.length);
+    if (nudged === null) return;
     view.dispatch({ selection: EditorSelection.cursor(nudged) });
     view.dispatch({ selection: EditorSelection.cursor(pos) });
   });
@@ -5833,6 +5857,8 @@ onMounted(async () => {
       completionKeymap,
       insertCompletionText,
       nextSnippetField,
+      hasNextSnippetField,
+      hasPrevSnippetField,
       closeCompletion,
       moveCompletionSelection,
       selectedCompletion,
@@ -5887,6 +5913,8 @@ onMounted(async () => {
   codeMirrorStartCompletion = startCompletion;
   codeMirrorInsertCompletionText = insertCompletionText;
   codeMirrorNextSnippetField = nextSnippetField;
+  codeMirrorHasNextSnippetField = hasNextSnippetField;
+  codeMirrorHasPrevSnippetField = hasPrevSnippetField;
   codeMirrorIndentMore = indentMore;
   codeMirrorIndentLess = indentLess;
   codeMirrorCopyLineDown = copyLineDown;
@@ -6525,6 +6553,8 @@ onMounted(async () => {
           }
           if (update.transactions.some((tr) => tr.isUserEvent("input.paste"))) {
             resyncCaretAfterPaste(update.view);
+          } else if (update.transactions.some((tr) => tr.isUserEvent("input.complete"))) {
+            resyncCaretAfterCompletion(update.view);
           }
         }
         if (update.selectionSet || update.docChanged) {

@@ -3,7 +3,9 @@
 import { createApp, h, nextTick, reactive, type App } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
-import { completionStatus, currentCompletions, selectedCompletion, setSelectedCompletion } from "@codemirror/autocomplete";
+import { completionStatus, currentCompletions, hasNextSnippetField, nextSnippetField, selectedCompletion, setSelectedCompletion, snippet, startCompletion } from "@codemirror/autocomplete";
+import { undo } from "@codemirror/commands";
+import { StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseType } from "@/types/database";
@@ -694,6 +696,173 @@ describe("mounted QueryEditor: typing after an accepted INSERT column", () => {
       await typeKeys(view, ",user_i");
       await acceptWhenVisible(view, host, false);
       await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id,user_id|)");
+    });
+  });
+
+  // WebKit (macOS WKWebView) can keep its native typing position where CodeMirror
+  // rewrote DOM text even though the DOM selection is right (queryEditorPasteCaretResync.ts).
+  // These tests only show that an accepted completion gets the same
+  // re-anchor as a paste; happy-dom cannot show the WebKit behaviour itself.
+  describe("WebKit caret re-anchor after an accepted completion", () => {
+    // Selection-only transactions (the re-anchor is two of them: away, then back).
+    function recordCaretMoves(view: EditorView) {
+      const moves: number[] = [];
+      view.dispatch({
+        effects: StateEffect.appendConfig.of(
+          EditorView.updateListener.of((update) => {
+            for (const tr of update.transactions) if (!tr.docChanged && tr.selection) moves.push(tr.selection.main.head);
+          }),
+        ),
+      });
+      return moves;
+    }
+
+    it("single column via Enter re-anchors once after the accepting update and keeps the caret after the column", async () => {
+      const { view, state } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      expect(view.state.doc.toString()).toBe("insert into organization_user (organization_id)");
+      // Scheduled, not applied inside the accepting update.
+      expect(moves).toEqual([]);
+      await settle();
+      expect(moves).toEqual([47, 46]);
+      await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id|)");
+    });
+
+    it("re-anchors before a next key that arrives before the frame", async () => {
+      // WKWebView delivered the comma ~7 ms after Enter, before any frame. happy-dom runs
+      // rAF via setImmediate, so the first microtask boundary after the accepting keydown
+      // stands in for "the next key event, before the frame".
+      const { view, state } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      await Promise.resolve();
+      expect(moves).toEqual([47, 46]);
+      typeAtNativeCaret(view, ",");
+      await settle();
+      expect(moves).toEqual([47, 46]);
+      expectCaret(view, state, "insert into organization_user (organization_id,|)");
+    });
+
+    it("checked columns without fields re-anchor around the corrected caret, not the snippet start", async () => {
+      const { view, host, state } = await open("insert into organization_user (|) values (1, 23)");
+      await checkWithKeys(view, host, ["organization_id"]);
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+      await settle();
+      // applyInsertColumnsSnippet moves the caret to 46, then the re-anchor goes 47 and back.
+      expect(moves).toEqual([46, 47, 46]);
+      await expectCommaTypedAtCaret(view, state, "insert into organization_user (organization_id|) values (1, 23)");
+    });
+
+    it("leaves a selected VALUES placeholder alone", async () => {
+      // Unfocused for the same happy-dom selectionchange reason as the placeholder test above.
+      const { view, host } = await open("insert into organization_user (|)", PG_CONTROLLED, false);
+      await checkWithKeys(view, host, ["organization_id"]);
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      await vi.waitFor(() => expect(completionStatus(view.state)).toBeNull());
+      await settle();
+      expect(moves).toEqual([]);
+      const doc = "insert into organization_user (organization_id) VALUES (value)";
+      expect(view.state.doc.toString()).toBe(doc);
+      expect(view.state.selection.main.from).toBe(doc.lastIndexOf("value"));
+      expect(view.state.selection.main.to).toBe(doc.lastIndexOf("value") + "value".length);
+    });
+
+    it("does not move the caret after a newer edit in the same task", async () => {
+      const { view, state } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      typeAtNativeCaret(view, ",");
+      await settle();
+      expect(moves).toEqual([]);
+      expectCaret(view, state, "insert into organization_user (organization_id,|)");
+    });
+
+    it("does not re-anchor while an IME composition started in the same task", async () => {
+      const { view } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      await settle();
+      expect(moves).toEqual([]);
+      view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+      await settle();
+      expect(view.state.doc.toString()).toBe("insert into organization_user (organization_id)");
+    });
+
+    it("does nothing once the editor is unmounted before the re-anchor runs", async () => {
+      const { view } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      for (const cleanup of cleanups.splice(0)) cleanup();
+      await settle();
+      expect(moves).toEqual([]);
+    });
+
+    // Guard contract only: the installed snippet() is applied directly (not through the
+    // SQL provider) as an input.complete transaction with two distinct fields, the first empty.
+    it("leaves an active snippet with an empty first field alone", async () => {
+      // Unfocused: selecting the second field writes a non-empty DOM selection (happy-dom artifact above).
+      const { view } = await mountAt("-- |", PG_CONTROLLED);
+      expect(completionStatus(view.state)).toBeNull();
+      const moves = recordCaretMoves(view);
+      const at = view.state.selection.main.head;
+      snippet("f(${1}, ${2:b})")(view, { label: "f" }, at, at);
+      expect(view.state.doc.toString()).toBe("-- f(, b)");
+      expect(view.state.selection.main.head).toBe(5);
+      expect(hasNextSnippetField(view.state)).toBe(true);
+      await settle();
+      expect(moves).toEqual([]);
+      expect(hasNextSnippetField(view.state)).toBe(true);
+      expect(nextSnippetField(view)).toBe(true);
+      expect(view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to)).toBe("b");
+    });
+
+    it("leaves a completion session started before the re-anchor runs alone", async () => {
+      const { view } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      expect(startCompletion(view)).toBe(true);
+      expect(completionStatus(view.state)).toBe("pending");
+      await settle();
+      expect(moves).toEqual([]);
+      expect(completionStatus(view.state)).not.toBeNull();
+      expect(keydown(view, { key: "Escape", code: "Escape" }).defaultPrevented).toBe(true);
+      expect(completionStatus(view.state)).toBeNull();
+      expect(view.state.doc.toString()).toBe("insert into organization_user (organization_id)");
+      expect(view.state.selection.main.head).toBe(46);
+    });
+
+    it("one undo after the re-anchor restores the SQL before the accept", async () => {
+      const { view, state } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      const moves = recordCaretMoves(view);
+      expect(keydown(view, { key: "Enter", code: "Enter" }).defaultPrevented).toBe(true);
+      await settle();
+      expect(moves).toEqual([47, 46]);
+      expect(undo(view)).toBe(true);
+      expect(view.state.doc.toString()).toBe("insert into organization_user ()");
+      await nextTick();
+      expect(state.sql).toBe("insert into organization_user ()");
+    });
+
+    it("typing gets no extra re-anchor", async () => {
+      const { view } = await open("insert into organization_user (|)");
+      await highlightWithArrows(view, "organization_id");
+      expect(keydown(view, { key: "Escape", code: "Escape" }).defaultPrevented).toBe(true);
+      const moves = recordCaretMoves(view);
+      typeAtNativeCaret(view, "x");
+      await settle();
+      expect(moves).toEqual([]);
     });
   });
 });
