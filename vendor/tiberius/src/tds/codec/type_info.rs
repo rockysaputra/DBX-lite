@@ -311,10 +311,15 @@ impl TypeInfo {
                     | VarLenType::BigVarChar
                     | VarLenType::BigBinary
                     | VarLenType::BigVarBin => src.read_u16_le().await? as usize,
-                    VarLenType::Image | VarLenType::Text | VarLenType::NText => {
-                        src.read_u32_le().await? as usize
+                    VarLenType::Image
+                    | VarLenType::Text
+                    | VarLenType::NText
+                    | VarLenType::SSVariant => src.read_u32_le().await? as usize,
+                    _ => {
+                        return Err(Error::Protocol(
+                            format!("column type {:?} is not supported", ty).into(),
+                        ))
                     }
-                    _ => todo!("not yet implemented for {:?}", ty),
                 };
 
                 let collation = match ty {
@@ -395,5 +400,32 @@ mod tests {
 
             assert_eq!(nti, ti)
         }
+    }
+
+    #[tokio::test]
+    async fn sql_variant_column_decodes_with_its_max_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::SSVariant as u8);
+        buf.put_u32_le(8009);
+
+        let ti = TypeInfo::decode(&mut buf.into_sql_read_bytes())
+            .await
+            .expect("decode must succeed");
+
+        assert_eq!(
+            ti,
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::SSVariant, 8009, None))
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_column_type_is_an_error() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(VarLenType::Udt as u8);
+        buf.put_u16_le(0xffff);
+
+        let result = TypeInfo::decode(&mut buf.into_sql_read_bytes()).await;
+
+        assert!(matches!(result, Err(Error::Protocol(_))));
     }
 }

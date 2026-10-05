@@ -15,7 +15,11 @@ where
         (2, _) => ColumnData::I16(Some(src.read_i16_le().await?)),
         (4, _) => ColumnData::I32(Some(src.read_i32_le().await?)),
         (8, _) => ColumnData::I64(Some(src.read_i64_le().await?)),
-        _ => unimplemented!(),
+        _ => {
+            return Err(crate::Error::Protocol(
+                format!("intn: length of {} is invalid", recv_len).into(),
+            ))
+        }
     };
 
     Ok(res)

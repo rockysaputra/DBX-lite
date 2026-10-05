@@ -1905,7 +1905,10 @@ async fn do_execute_typed(
             // when no transaction is open).
             if statement_result.as_ref().err().is_some_and(|error| {
                 error == QUERY_CANCELED
-                    || matches!(pool_error_action(pool_db_type, error), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)
+                    || matches!(
+                        pool_error_action(pool_db_type, error),
+                        PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry
+                    )
             }) {
                 // A cancelled read may leave unread protocol packets; discard rather than issue SQL.
                 let _ = tokio::time::timeout(Duration::from_secs(5), conn.disconnect()).await;

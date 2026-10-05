@@ -4961,9 +4961,13 @@ impl AppState {
             let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let mut conn = session.connection.lock().await;
                 crate::query::rollback_manual_txn_connection(&mut conn).await
-            }).await;
+            })
+            .await;
             if !matches!(outcome, Ok(Ok(()))) {
-                log::warn!("[connection:manual-txn:rollback-on-disconnect] session={} cleanup failed or timed out", session_id);
+                log::warn!(
+                    "[connection:manual-txn:rollback-on-disconnect] session={} cleanup failed or timed out",
+                    session_id
+                );
             }
         }
     }

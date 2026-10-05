@@ -517,6 +517,7 @@ fn sqlserver_column_type_name(column: &tiberius::Column) -> String {
         ColumnType::BigChar => "char".to_string(),
         ColumnType::BigVarBin => "varbinary".to_string(),
         ColumnType::BigBinary => "binary".to_string(),
+        ColumnType::SSVariant => "sql_variant".to_string(),
         column_type => format!("{column_type:?}").to_lowercase(),
     }
 }
