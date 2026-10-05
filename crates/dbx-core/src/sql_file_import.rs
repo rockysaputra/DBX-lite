@@ -1,7 +1,7 @@
 use std::io::Read as StdRead;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, BufReader};
@@ -541,7 +541,10 @@ pub async fn execute_sql_file_paths(
                 }
             }
             pending_statements.extend(next_statements);
-            if !sql_file_statement_batch_is_full(pending_statements.len(), buffered_statement_bytes(&pending_statements)) {
+            if !sql_file_statement_batch_is_full(
+                pending_statements.len(),
+                buffered_statement_bytes(&pending_statements),
+            ) {
                 continue;
             }
             execute_sql_file_statement_batch(

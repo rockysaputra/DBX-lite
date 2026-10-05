@@ -21,7 +21,8 @@ fn local_config() -> ConnectionConfig {
         "query_timeout_secs": 30,
         "idle_timeout_secs": 60,
         "keepalive_interval_secs": 0
-    })).expect("local connection configuration")
+    }))
+    .expect("local connection configuration")
 }
 
 async fn setup(config: &ConnectionConfig) -> (Arc<AppState>, std::path::PathBuf, String) {
