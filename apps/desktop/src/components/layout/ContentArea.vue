@@ -16,8 +16,10 @@ import {
   Columns3Cog,
   Copy,
   EyeOff,
+  FileCode,
   Gauge,
   Loader2,
+  PencilRuler,
   Search,
   TableProperties,
   ChevronDown,
@@ -151,6 +153,8 @@ import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchiv
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { isTableDataEditable } from "@/lib/table/tableEditing";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
+import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
+import { canEditTableStructure } from "@/lib/table/tableStructureCapabilities";
 import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
 import type { CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
@@ -170,7 +174,7 @@ import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import type { QueryTab, TableInfoTab, TreeNode, VectorCollectionMeta } from "@/types/database";
-import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
+import { sqlObjectNavigationTypeFromTableType, type SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
@@ -329,6 +333,28 @@ const activeResultConnectionId = computed(() => activeResultExecutionTarget.valu
 const activeResultDatabase = computed(() => activeResultExecutionTarget.value?.database ?? props.activeTab.database);
 const activeResultSchema = computed(() => activeResultExecutionTarget.value?.schema ?? props.activeTab.schema);
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(activeResultConnection.value));
+// Structured identity for the data toolbar's Edit Structure / View DDL actions. The table name is passed
+// through untouched (it may legitimately contain dots or quotes); nothing is loaded to build it.
+const dataTableActionTarget = computed<SqlObjectNavigationTarget | undefined>(() => {
+  const meta = activeDataTabTableMeta.value;
+  if (!meta?.tableName.trim()) return undefined;
+  return {
+    name: meta.tableName,
+    database: meta.database ?? props.activeTab.database,
+    schema: meta.schema ?? props.activeTab.schema,
+    type: sqlObjectNavigationTypeFromTableType(meta.tableType),
+  };
+});
+// App routes these actions by the tab's own connection id, so capabilities come from that connection
+// (not from a result execution target on another one); an unresolved connection offers no actions.
+const dataTableEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(connectionStore.getConfig(props.activeTab.connectionId)));
+const dataTableActionsAvailable = computed(() => !!props.activeTab.result && !!props.activeTab.connectionId && !!dataTableActionTarget.value && !!dataTableEffectiveDatabaseType.value);
+const showViewTableDdlAction = computed(() => {
+  const type = dataTableActionTarget.value?.type;
+  const isRelation = type === "table" || type === "view" || type === "materialized_view";
+  return dataTableActionsAvailable.value && isRelation && getTableMetadataCapabilities(dataTableEffectiveDatabaseType.value).ddl;
+});
+const showEditTableStructureAction = computed(() => dataTableActionsAvailable.value && dataTableActionTarget.value?.type === "table" && canEditTableStructure(dataTableEffectiveDatabaseType.value));
 const activeVectorConnection = computed(() => connectionStore.getConfig(props.activeTab.connectionId) ?? props.activeConnection);
 const activeDataTabExecutionDatabase = computed(() => dataTabExecutionDatabase(props.activeConnection, props.activeTab.database, activeDataTabTableMeta.value?.catalog));
 const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
@@ -903,6 +929,14 @@ function onHandleViewTableDdl(target: SqlObjectNavigationTarget) {
 
 function onHandleEditTableStructure(target: SqlObjectNavigationTarget) {
   emit("editTableStructure", props.activeTab.id, target);
+}
+
+function openDataTableStructure() {
+  if (dataTableActionTarget.value) onHandleEditTableStructure(dataTableActionTarget.value);
+}
+
+function openDataTableDdl() {
+  if (dataTableActionTarget.value) onHandleViewTableDdl(dataTableActionTarget.value);
 }
 
 function onHandleOpenObjectSource(target: SqlObjectNavigationTarget, initialEditing: boolean) {
@@ -2016,6 +2050,12 @@ defineExpose({
           <span v-if="showDataColumnsChip && activeDataTabTableMeta" class="inline-flex shrink-0 items-center rounded border border-border bg-muted/30 px-2 py-0.5 font-medium text-muted-foreground tabular-nums"> {{ activeDataTabTableMeta.columns.length }} {{ t("tree.columns") }} </span>
           <span class="ml-auto" />
           <DataGridColumnLayoutPopover v-if="activeTab.result?.columns.length" :grid="dataGridRef" trigger-class="px-1.5" />
+          <Button v-if="showDataTableInfoButton && showEditTableStructureAction" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :aria-label="t('contextMenu.editStructure')" :title="t('contextMenu.editStructure')" @click="openDataTableStructure"
+            ><PencilRuler class="h-3.5 w-3.5" /><span v-if="!dataToolbarCompact">{{ t("contextMenu.editStructure") }}</span></Button
+          >
+          <Button v-if="showDataTableInfoButton && showViewTableDdlAction" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :aria-label="t('contextMenu.viewDdl')" :title="t('contextMenu.viewDdl')" @click="openDataTableDdl"
+            ><FileCode class="h-3.5 w-3.5" /><span v-if="!dataToolbarCompact">{{ t("contextMenu.viewDdl") }}</span></Button
+          >
           <Button
             v-if="showDataTableInfoButton && activeTab.result && activeDataTabTableMeta && activeTab.connectionId"
             variant="ghost"
@@ -2269,6 +2309,14 @@ defineExpose({
             </PopoverContent>
           </Popover>
           <ToolbarOverflowMenu v-if="showDataToolbarOverflow" :label="t('toolbar.moreActions')">
+            <DropdownMenuItem v-if="showEditTableStructureAction" @select="openDataTableStructure">
+              <PencilRuler class="h-3.5 w-3.5" />
+              {{ t("contextMenu.editStructure") }}
+            </DropdownMenuItem>
+            <DropdownMenuItem v-if="showViewTableDdlAction" @select="openDataTableDdl">
+              <FileCode class="h-3.5 w-3.5" />
+              {{ t("contextMenu.viewDdl") }}
+            </DropdownMenuItem>
             <DropdownMenuItem v-if="activeTab.result && activeDataTabTableMeta && activeTab.connectionId" @select="dataGridRef?.toggleDdl()">
               <TableProperties class="h-3.5 w-3.5" />
               {{ t("grid.tableInfo") }}

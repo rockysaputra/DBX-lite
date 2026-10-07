@@ -1017,9 +1017,16 @@ describe("DocumentBrowser MongoDB filter value types", () => {
     app.mount(root!);
     await flushUi();
 
+    // ensureDocumentFilterRule only seeds a rule once field metadata exists, and that comes from the loaded documents. The grid can render
+    // as a pre-load placeholder, so wait for the fixture row itself before opening the filter popover.
+    await vi.waitFor(() => {
+      const rows = JSON.parse(root!.querySelector<HTMLElement>('[data-testid="data-grid"]')?.dataset.resultRows ?? "[]");
+      expect(rows).toEqual([["1", "String id"]]);
+    });
+
     root!.querySelector<HTMLButtonElement>('[data-testid="data-grid"] button')!.click();
     await flushUi();
-    expect(document.body.querySelector('[data-testid="select"][data-model-value="auto"]')).not.toBeNull();
+    expect(await waitForElement('[data-testid="select"][data-model-value="auto"]')).not.toBeNull();
 
     const clearButton = buttonWithText("grid.clearFilter");
     const addButton = buttonWithText("grid.filterBuilderAddRule");
@@ -1089,6 +1096,13 @@ describe("DocumentBrowser MongoDB filter value types", () => {
     });
     app.mount(root!);
     await flushUi();
+
+    // ensureDocumentFilterRule only seeds a rule once field metadata exists, and that comes from the loaded documents. The grid can render
+    // as a pre-load placeholder, so wait for the fixture row itself before opening the filter popover.
+    await vi.waitFor(() => {
+      const rows = JSON.parse(root!.querySelector<HTMLElement>('[data-testid="data-grid"]')?.dataset.resultRows ?? "[]");
+      expect(rows).toEqual([["document-1", "Example"]]);
+    });
 
     root!.querySelector<HTMLButtonElement>('[data-testid="data-grid"] button')!.click();
     await flushUi();
